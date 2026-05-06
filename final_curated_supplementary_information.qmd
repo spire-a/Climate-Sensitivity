@@ -1,0 +1,400 @@
+---
+title: "Supplementary Information"
+format:
+  docx:
+    toc: true
+    number-sections: true
+editor: visual
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+```{r}
+# ============================================================
+# SUPPLEMENTARY INFORMATION
+# Structural breaks reveal accelerating climate sensitivity
+# of global cereal production
+# ============================================================
+
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(stringr)
+library(readr)
+library(readxl)
+library(knitr)
+library(flextable)
+
+datpthout <- "C:/Users/arsovsp/Documents/Climate Risk/output/"
+date_str  <- format(Sys.Date(), "%Y%m%d")
+
+paper_title <- "Structural breaks reveal accelerating climate sensitivity of global cereal production"
+authors <- c(
+  "Spire Arsov*",
+  "Simone Pieralli"
+)
+corresponding_author <- "Spire Arsov"
+
+# ------------------------------------------------------------
+# Helper functions
+# ------------------------------------------------------------
+latest_file <- function(pattern, dir = datpthout, recursive = TRUE) {
+  ff <- list.files(dir, full.names = TRUE, recursive = recursive)
+  ff <- ff[grepl(pattern, basename(ff), ignore.case = TRUE)]
+  if (length(ff) == 0) return(NA_character_)
+  ff[which.max(file.info(ff)$mtime)]
+}
+
+latest_match <- function(patterns, dir = datpthout, recursive = TRUE) {
+  for (p in patterns) {
+    hit <- latest_file(p, dir = dir, recursive = recursive)
+    if (!is.na(hit)) return(hit)
+  }
+  NA_character_
+}
+
+resolve_fig <- function(candidates, dir = datpthout) {
+  for (nm in candidates) {
+    p <- file.path(dir, nm)
+    if (file.exists(p)) return(p)
+  }
+  NA_character_
+}
+
+safe_read_csv <- function(path) {
+  if (is.na(path) || is.null(path) || !file.exists(path)) return(NULL)
+  readr::read_csv(path, show_col_types = FALSE)
+}
+
+safe_include_graphics <- function(path, note = "Figure not available.") {
+  if (is.na(path) || is.null(path) || !file.exists(path)) {
+    cat(note)
+  } else {
+    knitr::include_graphics(path)
+  }
+}
+
+make_ft <- function(df, digits = 4, fontsize_body = 9) {
+  if (is.null(df) || nrow(df) == 0) return(NULL)
+
+  df2 <- df
+  num_cols <- vapply(df2, is.numeric, logical(1))
+  df2[num_cols] <- lapply(df2[num_cols], function(x) round(x, digits))
+
+  flextable(df2) %>%
+    theme_booktabs() %>%
+    autofit() %>%
+    fontsize(size = fontsize_body, part = "all") %>%
+    bold(part = "header") %>%
+    align(align = "center", part = "all") %>%
+    valign(valign = "center", part = "all")
+}
+
+show_table_or_note <- function(df, note = "Table not available.") {
+  if (inherits(df, "flextable")) {
+    df
+  } else if (is.null(df) || nrow(df) == 0) {
+    cat(note)
+  } else {
+    make_ft(df)
+  }
+}
+
+pstars <- function(p) dplyr::case_when(
+  is.na(p) ~ "",
+  p < 0.01 ~ "***",
+  p < 0.05 ~ "**",
+  p < 0.10 ~ "*",
+  TRUE ~ ""
+)
+```
+
+# Supplementary Information
+
+## `r paper_title`
+
+**`r paste(authors, collapse = ", ")`**
+
+**Corresponding author:** `r corresponding_author`
+
+**Data availability.** All data used in this study are publicly available.
+
+**Code availability.** Code can be made available upon request.
+
+This Supplementary Information is intentionally curated for peer review. It contains the France-specific levels diagnostics explicitly referenced in the manuscript, together with two compact panel-regression support tables that clarify the sample definition and the estimated regime shifts. Exhaustive machine-readable outputs, long annex tables, and full pipeline dumps should be kept in a separate reproducibility archive rather than in the reviewer-facing SI.
+
+\newpage
+
+# 1. France levels-based diagnostic case
+
+```{r}
+# ------------------------------------------------------------
+# France-specific objects and figure paths
+# ------------------------------------------------------------
+fig_france_barley <- resolve_fig(c(
+  "France_BA_Levels_Break_Diagnostic.png",
+  "France_Barley_Levels_Break_Diagnostic.png"
+))
+
+fig_france_maize <- resolve_fig(c(
+  "France_MA_Levels_Break_Diagnostic.png",
+  "France_Maize_Levels_Break_Diagnostic.png",
+  "France_Maize_Diagnostic.png"
+))
+
+fig_france_rapeseed <- resolve_fig(c(
+  "France_RP_Levels_Break_Diagnostic.png",
+  "France_Rapeseed_Levels_Break_Diagnostic.png"
+))
+
+fig_france_wheat <- resolve_fig(c(
+  "France_WT_Levels_Break_Diagnostic.png",
+  "France_Wheat_Levels_Break_Diagnostic.png"
+))
+
+france_coef_tbl <- NULL
+if (exists("fr_table_show")) {
+  france_coef_tbl <- fr_table_show
+} else if (exists("fr_table_raw")) {
+  france_coef_tbl <- fr_table_raw %>%
+    transmute(
+      Crop,
+      Break = ifelse(is.na(Break), "—", as.character(Break)),
+      `ME(GDD) Before`  = signif(me_gdd_before, 3),
+      `ME(GDD) After`   = signif(me_gdd_after, 3),
+      `ΔME(GDD)`        = ifelse(is.na(d_me_gdd), "NA", paste0(signif(d_me_gdd, 3), pstars(p_d_me_gdd))),
+      `ME(Prec) Before` = signif(me_prec_before, 3),
+      `ME(Prec) After`  = signif(me_prec_after, 3),
+      `ΔME(Prec)`       = ifelse(is.na(d_me_prec), "NA", paste0(signif(d_me_prec, 3), pstars(p_d_me_prec)))
+    )
+}
+```
+
+Table S1 reports the France-specific levels-based coefficients and regime contrasts that accompany the country diagnostic discussion in the main text. It gives reviewers a compact numerical companion to the crop-specific breakpoint figures.
+
+## Table S1. France levels-based coefficients and regime contrasts
+
+```{r}
+show_table_or_note(
+  france_coef_tbl,
+  "France coefficient table not available in this session. Render after running the France diagnostic chunk from the break-analysis script, or export a dedicated France table object first."
+)
+```
+
+Figure S1 shows the France barley diagnostic in levels. It is included to document how the selected breakpoint translates into visibly different fitted relationships across regimes for a crop discussed in the France case-study set.
+
+## Figure S1. France barley levels-based structural-break diagnostic
+
+```{r, fig.cap="Figure S1. France barley levels-based structural-break diagnostic.", out.width="95%"}
+safe_include_graphics(fig_france_barley, "Figure S1 not found.")
+```
+
+Figure S2 presents the France maize diagnostic that complements the main-text maize discussion. It shows the selected breakpoint, the regime-specific fit, and the deterioration in post-break explanatory power noted in the manuscript.
+
+## Figure S2. France maize levels-based structural-break diagnostic
+
+```{r, fig.cap="Figure S2. France maize levels-based structural-break diagnostic.", out.width="95%"}
+safe_include_graphics(fig_france_maize, "Figure S2 not found.")
+```
+
+Figure S3 provides the France rapeseed diagnostic. It is included because rapeseed displays one of the clearest statistically supported changes in the implied levels-based response surface in the France case.
+
+## Figure S3. France rapeseed levels-based structural-break diagnostic
+
+```{r, fig.cap="Figure S3. France rapeseed levels-based structural-break diagnostic.", out.width="95%"}
+safe_include_graphics(fig_france_rapeseed, "Figure S3 not found.")
+```
+
+Figure S4 reports the France wheat diagnostic, which complements the main text’s discussion of pronounced instability around the early 2000s and helps reviewers see the crop-specific fit deterioration directly.
+
+## Figure S4. France wheat levels-based structural-break diagnostic
+
+```{r, fig.cap="Figure S4. France wheat levels-based structural-break diagnostic.", out.width="95%"}
+safe_include_graphics(fig_france_wheat, "Figure S4 not found.")
+```
+
+\newpage
+
+# 2. Compact support for the first-difference panel results
+
+```{r}
+# ------------------------------------------------------------
+# Panel-result fallbacks: use objects if present, saved files otherwise
+# ------------------------------------------------------------
+fd_pool_coefs_obj <- if (exists("fd_pool_coefs")) {
+  fd_pool_coefs
+} else {
+  safe_read_csv(latest_match(c(
+    "^FD_Pool_coeffs_[0-9]{8}\\.csv$"
+  )))
+}
+
+fd_pool_ames_obj <- if (exists("fd_pool_ames")) {
+  fd_pool_ames
+} else if (exists("fd_pool_marginals")) {
+  fd_pool_marginals
+} else {
+  safe_read_csv(latest_match(c(
+    "^FD_Pool_AMEs_[0-9]{8}\\.csv$",
+    "^FD_Pool_marginals_[0-9]{8}\\.csv$"
+  )))
+}
+
+processed_breaks_obj <- if (exists("sensitivity_tagged")) {
+  sensitivity_tagged
+} else {
+  tmp <- safe_read_csv(latest_match(c(
+    "^Processed_data_breaks_flagged_[0-9]{8}\\.csv$"
+  )))
+  if (!is.null(tmp)) {
+    tmp %>%
+      mutate(
+        break_tag = if_else(break_year == 2022 | is.na(break_year), "NO_BREAK", "HAS_BREAK")
+      )
+  } else {
+    NULL
+  }
+}
+
+# ------------------------------------------------------------
+# Table S2: sample definition by crop
+# ------------------------------------------------------------
+panel_sample_tbl <- NULL
+if (!is.null(processed_breaks_obj)) {
+  panel_sample_tbl <- processed_breaks_obj %>%
+    mutate(
+      ccc = as.character(ccc),
+      ppp = as.character(ppp)
+    ) %>%
+    distinct(ccc, ppp, break_tag) %>%
+    count(ppp, break_tag, name = "n_panels") %>%
+    pivot_wider(names_from = break_tag, values_from = n_panels, values_fill = 0) %>%
+    mutate(total_panels = HAS_BREAK + NO_BREAK) %>%
+    arrange(desc(HAS_BREAK))
+}
+
+# ------------------------------------------------------------
+# Table S3: pooled coefficient decomposition (pre, shift, post)
+# ------------------------------------------------------------
+panel_coef_tbl <- NULL
+if (!is.null(fd_pool_coefs_obj)) {
+  climate_terms <- c("Delta_GDD", "I(Delta_GDD^2)", "Delta_Precip", "I(Delta_Precip^2)")
+
+  fd_pool_core <- fd_pool_coefs_obj %>%
+    mutate(
+      is_delta  = str_detect(term, "flag_before_after1"),
+      base_term = str_replace(term, ":flag_before_after1", "")
+    ) %>%
+    filter(base_term %in% climate_terms)
+
+  if (!("p.value" %in% names(fd_pool_core))) fd_pool_core$p.value <- NA_real_
+  if (!("r2_within" %in% names(fd_pool_core))) fd_pool_core$r2_within <- NA_real_
+
+  panel_beta <- fd_pool_core %>%
+    filter(!is_delta) %>%
+    transmute(
+      crop,
+      term = base_term,
+      beta_pre = estimate,
+      se_beta = std.error,
+      p_beta = p.value,
+      r2_within = r2_within
+    )
+
+  panel_delta <- fd_pool_core %>%
+    filter(is_delta) %>%
+    transmute(
+      crop,
+      term = base_term,
+      delta = estimate,
+      se_delta = std.error,
+      p_delta = p.value
+    )
+
+  panel_coef_tbl <- panel_beta %>%
+    full_join(panel_delta, by = c("crop", "term")) %>%
+    mutate(
+      beta_post = beta_pre + replace_na(delta, 0),
+      se_post = sqrt(se_beta^2 + replace_na(se_delta, 0)^2)
+    ) %>%
+    arrange(crop, match(term, climate_terms))
+}
+
+# ------------------------------------------------------------
+# Table S4: regime-specific AMEs used in the main interpretation
+# ------------------------------------------------------------
+panel_ame_tbl <- NULL
+if (!is.null(fd_pool_ames_obj)) {
+  if (!("conf.low" %in% names(fd_pool_ames_obj))) fd_pool_ames_obj$conf.low <- NA_real_
+  if (!("conf.high" %in% names(fd_pool_ames_obj))) fd_pool_ames_obj$conf.high <- NA_real_
+  if (!("p.value" %in% names(fd_pool_ames_obj))) fd_pool_ames_obj$p.value <- NA_real_
+
+  panel_ame_tbl <- fd_pool_ames_obj %>%
+    filter(term %in% c("Delta_GDD", "Delta_Precip")) %>%
+    mutate(
+      shock_scale = case_when(
+        term == "Delta_GDD" ~ 100,
+        term == "Delta_Precip" ~ 100,
+        TRUE ~ 1
+      ),
+      estimate = estimate * shock_scale,
+      conf.low = conf.low * shock_scale,
+      conf.high = conf.high * shock_scale,
+      term = recode(term,
+        "Delta_GDD" = "AME of ΔGDD (per 100 units)",
+        "Delta_Precip" = "AME of ΔPrecip (per 100 mm)"
+      )
+    ) %>%
+    transmute(
+      crop,
+      period,
+      term,
+      estimate,
+      conf.low,
+      conf.high,
+      p.value = p.value
+    ) %>%
+    arrange(term, crop, period)
+}
+```
+
+Table S2 defines the empirical base used in the first-difference panel stage. It reports, by crop, how many country–crop panels enter the break-based pooled sample and how many remain outside it because no validated break was assigned.
+
+## Table S2. Panel sample definition by crop
+
+```{r}
+show_table_or_note(
+  panel_sample_tbl,
+  "Panel sample-definition table not available. Render after creating the processed break dataset or keeping the latest Processed_data_breaks_flagged file in the output folder."
+)
+```
+
+Table S3 gives a compact decomposition of the pooled first-difference coefficients into pre-break slopes, shift terms, and implied post-break slopes. This lets reviewers see directly how the reported post-break effects are constructed without reproducing the full long-form regression dump.
+
+## Table S3. First-difference pooled coefficient decomposition
+
+```{r}
+show_table_or_note(
+  panel_coef_tbl,
+  "Pooled coefficient decomposition not available. Render after running the FD panel script or saving the latest FD_Pool_coeffs file."
+)
+```
+
+Table S4 reports the regime-specific average marginal effects underlying the main panel interpretation, expressed at the standardized 100-unit GDD shock and 100 mm precipitation shock used in the manuscript. It provides a compact numerical companion to the main panel figure without duplicating the full robustness annex.
+
+## Table S4. Regime-specific average marginal effects at standardized shocks
+
+```{r}
+show_table_or_note(
+  panel_ame_tbl,
+  "Regime-specific AME table not available. Render after running the FD panel script or saving the latest FD_Pool_AMEs file."
+)
+```
+
+\newpage
+
+# 3. Note on longer outputs
+
+The full replication workflow also produces longer annexes and machine-readable exports, including complete breakpoint tables for all country–crop pairs, variable-level break-driver dumps, long panel-inclusion lists, and extended robustness outputs. These materials are useful for full reproducibility, but they are better supplied as a separate archive or repository rather than embedded in the reviewer-facing Supplementary Information.

@@ -1,0 +1,3371 @@
+---
+title: "Climate sensitivity"
+format: docx
+editor: visual
+---
+
+## Libraries and paths
+
+```{r}
+library(readxl)
+library(dplyr)
+library(purrr)
+library(stringdist)
+library(writexl)
+library(readr)
+library(tidyr)
+library(stringr)
+library(broom)
+library(ggplot2)
+library(future.apply)
+library(strucchange)
+library(zoo)
+library(patchwork)
+library(WDI)
+library(marginaleffects)
+library(kableExtra)
+library(lmtest)  
+library(plm)
+library(sp)
+library(margins)
+library(VIM)
+library(ggbeeswarm)
+#Some libararies are for testings purposes only
+
+
+EUN <- c("AUT", "BEL", "BGR", "CYP", "CZE", "DEU", "DNK", "ESP", 
+         "EST", "FIN", "FRA", "GRC", "HRV", "HUN", "IRL", "ITA", 
+         "LTU", "LUX", "LVA", "MLT", "NLD", "POL", "PRT", "ROU", 
+         "SVK", "SVN", "SWE")
+e14 <- c("AUT", "BEL", "DNK", "FIN", "FRA", "DEU", "GRC", "IRL", 
+         "ITA", "LUX", "NLD", "PRT", "ESP", "SWE")
+nms <- c("BGR", "CYP", "CZE", "EST", "HRV", "HUN", "LVA", "LTU", 
+         "MLT", "POL", "ROU", "SVK", "SVN")
+
+# Define region groups:
+ex_yug <- c("BIH", "HRV", "MKD", "MNE", "SRB", "SVN", "YUG") 
+ex_ussr <- c("ARM", "AZE", "BLR", "EST", "GEO", "KAZ", "KGZ", 
+             "LVA", "LTU", "MDA", "RUS", "TJK", "TKM", "UKR", "UZB")
+former_sdn <- c("SDN", "SSDN")  
+ETF   <- c("ERI","ETH")
+BLX   <-c("BEL","LUX")
+CSK   <-c("CZE","SVK")
+CHN   <-c("HKG","MAC","CHN","TWN")
+YSR   <-c("BIH","HRV","MKD","SVN","MNE","SRB","SER")
+LANT  <-c("AIA","ATG","ABW","BRB","VGB","DMA","GRD","GLP","MTQ","MSR","ANT","KNA","LCA","VCT","VIR")
+POLY  <-c("ASM","COK","PYF","NIU","WSM","TKL","TON","TUV","WLF")
+MICRO <-c("GUM","KIR","MHL","FSM","NRU","MNP","PCI","PLW")
+FIN   <- c("FIN","ALA")
+
+
+datpth    <- "C:/Users/arsovsp/Documents/Climate Risk/data/"
+datpthout <- "C:/Users/arsovsp/Documents/Climate Risk/output/"
+
+
+map_wld <- read_rds(paste0(datpth,"globalmap.rds"))
+
+
+
+```
+
+#1.Load Yield Data
+
+```{r}
+#1. Load Yield Data
+# Load raw FAO data and mapping files
+country_mapping <- read.csv(paste0(datpth, "FAO_ISO_Country_List.csv"))
+crop_mapping <- read.csv(paste0(datpth, "FAO_to_GAMS_Crop_Mapping.csv"))
+fao_data <- read_excel(paste0(datpth, "FAOSTAT_CRP.xlsx"))
+
+# Create mapping for element and crop names
+element_mapping <- c("area harvested" = "AH", "yield" = "YLD", "production" = "QP")
+crop_name_mapping <- c(
+  "Barley" = "BA", "Oats" = "OT", "Rice" = "RI", 
+  "Rape or colza seed" = "RP", "Rye" = "RY", 
+  "Soya beans" = "SB", "Sunflower seed" = "SF", 
+  "Sorghum" = "SO", "Wheat" = "WT", "Maize (corn)" = "MA"
+)
+
+# Preprocess FAO data
+fao_data <- fao_data %>%
+  mutate(
+    Element = trimws(tolower(Element)),
+    mmm = element_mapping[Element],
+    ppp = crop_name_mapping[Item]
+  ) %>%
+  filter(!is.na(ppp) & !is.na(mmm))
+
+# Rename and clean year columns
+year_columns <- colnames(fao_data)[grepl("^Y", colnames(fao_data))]
+colnames(fao_data)[grepl("^Y", colnames(fao_data))] <- sub("^Y", "", year_columns)
+year_columns <- sub("^Y", "", year_columns)
+
+# Convert units for yield
+fao_data <- fao_data %>%
+  mutate(across(all_of(year_columns),
+                ~ ifelse(Element == "yield" & Unit == "100 g/ha", . / 10000, .))) %>%
+  mutate(Unit = ifelse(Element == "yield" & Unit == "100 g/ha", "tons/ha", Unit))
+country_mapping[which(country_mapping$ISO_Code== "TUR"),"FAO.Country.Name"]<-"Türkiye"
+# Join ISO codes and filter
+fao_data <- fao_data %>%
+  left_join(country_mapping, by = c("Area" = "FAO.Country.Name")) %>%
+  rename(ccc = ISO_Code) %>%
+  filter(!is.na(ccc) & trimws(ccc) != "")
+
+# Pivot to long format
+fao_data_long <- fao_data %>%
+  pivot_longer(
+    cols = all_of(year_columns),
+    names_to = "yyy",
+    values_to = "value"
+  ) %>%
+  mutate(yyy = as.numeric(yyy))
+
+# Pivot to wide: AH, YLD, QP
+fao_data_wide <- fao_data_long %>%
+  pivot_wider(
+    id_cols = c(ccc, Item, ppp, yyy),
+    names_from = mmm,
+    values_from = value,
+    values_fn = function(x) x[1],
+    values_fill = list(value = NA)
+  )
+
+# Initial cleaned yield data
+fao_yield_data <- fao_data_wide
+
+# Add region mapping for all composites
+fao_yield_data <- fao_yield_data %>%
+  mutate(region_ccc = case_when(
+    ccc %in% ex_yug ~ "YSR",
+    ccc %in% ex_ussr ~ "USSR",
+    ccc %in% former_sdn ~ "FSDN",
+    ccc %in% BLX ~ "BLX",
+    ccc %in% ETF ~ "ETF",
+    TRUE ~ ccc
+  ))
+
+# --- STEP 1: FAO-supplied synthetic regions ---
+
+fao_synthetic_regions <- fao_yield_data %>%
+  filter(ccc %in% c("USSR", "YSR", "FSDN", "BLX", "ETF")) %>%
+  filter(!is.na(YLD) & YLD > 0) %>%
+  filter(!(ccc %in% c("USSR", "YSR") & yyy > 1991)) %>%  # cutoff only for USSR & YSR
+  mutate(
+    Yield_Imputed = FALSE,
+    synthetic = TRUE,
+    source = "FAO"
+  )
+
+
+# --- STEP 2: Aggregated yields from member countries ---
+agg_yield_series <- fao_yield_data %>%
+  filter(region_ccc %in% c("USSR", "YSR", "FSDN", "BLX", "ETF") & ccc != region_ccc) %>%
+  group_by(region_ccc, yyy, ppp) %>%
+  summarize(
+    Total_Production = sum(QP, na.rm = TRUE),
+    Total_Area = sum(AH, na.rm = TRUE),
+    YLD = if_else(Total_Area == 0, NA_real_, Total_Production / Total_Area),
+    AH = Total_Area,
+    QP = Total_Production,
+    Item = first(na.omit(Item)),
+    .groups = "drop"
+  ) %>%
+  rename(ccc = region_ccc) %>%
+  mutate(
+    Yield_Imputed = TRUE,
+    source = "Aggregated"
+  )
+
+# --- STEP 3: Clean join keys before removing overlaps ---
+fao_synthetic_regions <- fao_synthetic_regions %>%
+  mutate(across(c(ccc, ppp), as.character), yyy = as.numeric(yyy), ccc = trimws(ccc))
+agg_yield_series <- agg_yield_series %>%
+  mutate(across(c(ccc, ppp), as.character), yyy = as.numeric(yyy), ccc = trimws(ccc))
+
+agg_yield_series_clean <- agg_yield_series %>%
+  anti_join(fao_synthetic_regions %>% select(ccc, yyy, ppp), by = c("ccc", "yyy", "ppp"))
+
+# --- STEP 4: Prepare Final dataset ---
+
+fao_yield_data_clean <- fao_yield_data %>%
+  filter(!ccc %in% c("USSR", "YSR", "FSDN", "BLX", "ETF"))
+
+fao_yield_data_final <- bind_rows(
+  fao_yield_data_clean,
+  fao_synthetic_regions,
+  agg_yield_series_clean
+) %>%
+  distinct(ccc, yyy, ppp, .keep_all = TRUE) %>%
+  filter(!is.na(YLD) & YLD > 0)   # <<< REMOVE 0 or NA yields here
+
+
+
+```
+
+###1.1 Clean yield data
+
+```{r}
+
+# Plausible physical caps for yields (t/ha)
+yld_caps <- tribble(
+  ~ppp, ~yld_max,
+  "MA", 15,   # Maize
+  "BA",  9,   # Barley
+  "WT",  9.5, # Wheat
+  "RP",  5,   # Rapeseed
+  "SB",  6.5, # Soybean
+  "SF",  5    # Sunflower
+)
+
+min_yld <- 0.10        # treat <0.1 t/ha as invalid
+rel_tol <- 0.10        # 10% tolerance vs QP/AH
+max_spike_ratio <- 3   # spike if YLD_t / YLD_{t-1} > 3 or < 1/3
+
+
+# =========================== 1) FLAGGING =========================
+df_flagged <- fao_yield_data_final %>%
+  left_join(yld_caps, by = "ppp") %>%
+  arrange(ccc, ppp, yyy) %>%
+  group_by(ccc, ppp) %>%
+  mutate(
+    # internal consistency
+    yld_from_QP_AH = ifelse(!is.na(QP) & !is.na(AH) & AH > 0, QP / AH, NA_real_),
+    flag_yld_mismatch = !is.na(yld_from_QP_AH) & !is.na(YLD) &
+                        abs(YLD - yld_from_QP_AH) > rel_tol * yld_from_QP_AH,
+
+    # plausibility
+    flag_yld_low  = !is.na(YLD) & YLD < min_yld,
+    flag_yld_high = !is.na(YLD) & !is.na(yld_max) & YLD > yld_max,
+
+    # area/production sanity
+    flag_AH_nonpos = !is.na(AH) & AH <= 0,
+    flag_QP_nonpos = !is.na(QP) & QP <= 0,
+
+    # spikes
+    lag_yld  = dplyr::lag(YLD),
+    ratio_up = ifelse(!is.na(lag_yld) & !is.na(YLD) & lag_yld > 0, YLD / lag_yld, NA_real_),
+    flag_spike = !is.na(ratio_up) & (ratio_up > max_spike_ratio | ratio_up < 1 / max_spike_ratio),
+
+    # series outliers (3*IQR fences)
+    Q1  = quantile(YLD, 0.25, na.rm = TRUE),
+    Q3  = quantile(YLD, 0.75, na.rm = TRUE),
+    IQRv = Q3 - Q1,
+    low_fence  = Q1 - 3 * IQRv,
+    high_fence = Q3 + 3 * IQRv,
+    flag_iqr_outlier = !is.na(YLD) & !is.na(low_fence) & !is.na(high_fence) &
+                       (YLD < low_fence | YLD > high_fence)
+  ) %>%
+  ungroup() %>%
+  mutate(
+    flag_any = flag_yld_mismatch | flag_yld_low | flag_yld_high |
+               flag_AH_nonpos   | flag_QP_nonpos | flag_spike | flag_iqr_outlier
+  )
+
+# Keep only your six crops
+df_flagged_main <- df_flagged %>%
+  filter(ppp %in% c("BA", "SB", "SF", "WT", "MA", "RP"))
+
+
+# ============== 2) COUNTRY × CROP SUMMARY (flags) ===============
+flag_summary_country_crop_main <- df_flagged_main %>%
+  group_by(ccc, ppp) %>%
+  summarise(
+    n_obs            = n(),
+    n_flag_any       = sum(flag_any, na.rm = TRUE),
+    share_flag_any   = ifelse(n_obs > 0, n_flag_any / n_obs, NA_real_),
+    n_mismatch       = sum(flag_yld_mismatch, na.rm = TRUE),
+    n_low            = sum(flag_yld_low, na.rm = TRUE),
+    n_high           = sum(flag_yld_high, na.rm = TRUE),
+    n_spike          = sum(flag_spike, na.rm = TRUE),
+    n_iqr_outlier    = sum(flag_iqr_outlier, na.rm = TRUE),
+    n_AH_nonpos      = sum(flag_AH_nonpos, na.rm = TRUE),
+    n_QP_nonpos      = sum(flag_QP_nonpos, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+
+# ======== 3) VERY PROBLEMATIC SERIES + SEVERITY SCORE ==========
+very_problematic <- flag_summary_country_crop_main %>%
+  mutate(
+    hard_issue    = (n_high > 0) | (n_low >= 2) | (n_AH_nonpos > 0) | (n_QP_nonpos > 0),
+    many_flags    = n_flag_any >= pmax(5, ceiling(0.15 * n_obs)),
+    spiky         = n_spike >= 4,
+    distro_out    = n_iqr_outlier >= 3,
+    mismatch_many = n_mismatch >= 2,
+    share_high    = (share_flag_any >= 0.15 & n_obs >= 20),
+
+    very_problematic = hard_issue | many_flags | spiky | distro_out | mismatch_many | share_high,
+
+    severity_score = 2.0*hard_issue +
+                     1.5*share_high +
+                     1.2*many_flags +
+                     1.0*spiky +
+                     0.8*distro_out +
+                     0.5*mismatch_many +
+                     0.3*(n_obs < 20)
+  ) %>%
+  filter(very_problematic) %>%
+  arrange(desc(severity_score), desc(share_flag_any), desc(n_flag_any))
+
+# (Optional) peek
+# print(very_problematic)
+# print(very_problematic %>% filter(severity_score >= 4))
+
+
+# ===================== 4) DROP LISTS (with reasons) =====================
+# A) Irrelevant / marginal country–crop pairs (manual list)
+irrelevant_series <- tribble(
+  ~ccc, ~ppp,
+  "CPV","MA","QAT","MA","ARE","MA","KWT","MA",
+  "OMN","BA","VCT","MA","TJK","RP","TJK","SB",
+  "QAT","WT","ERI","MA","NAM","SF","SSD","SF","LSO","WT","CPV","MA"
+) %>% mutate(reason = "irrelevant")
+
+# B) Severity ≥ 4
+problematic_high <- very_problematic %>%
+  filter(severity_score >= 4) %>%
+  transmute(ccc, ppp, reason = "severity_ge_4")
+
+# C) Short AND noisy (fixing the earlier OR)
+short_or_sparse <- flag_summary_country_crop_main %>%
+  mutate(share_flag_any = n_flag_any / pmax(n_obs, 1)) %>%
+  filter(n_obs < 20 & share_flag_any > 0.25) %>%      # AND: short AND noisy
+  transmute(ccc, ppp, reason = "short_and_noisy")
+
+# Combine unique pairs
+to_drop <- bind_rows(
+  irrelevant_series,
+  problematic_high,
+  short_or_sparse
+) %>%
+  distinct(ccc, ppp, .keep_all = TRUE)
+
+# ===================== 5) KEY NORMALIZATION & AUDIT =====================
+# Normalize join keys on BOTH sides (type/trim/case)
+to_drop <- to_drop %>%
+  mutate(across(c(ccc, ppp), ~ toupper(trimws(as.character(.)))))
+
+fao_norm <- fao_yield_data_final %>%
+  mutate(across(c(ccc, ppp), ~ toupper(trimws(as.character(.)))))
+
+# Warn if drop list contains codes not present in data
+not_in_data <- to_drop %>%
+  anti_join(fao_norm %>% distinct(ccc, ppp), by = c("ccc","ppp"))
+if (nrow(not_in_data)) {
+  message("WARNING: entries in drop list not found in data (check codes):")
+  print(not_in_data)
+}
+
+# ===================== 6) APPLY DROP + REPORT ===========================
+fao_yield_data_final_clean <- fao_norm %>%
+  anti_join(to_drop, by = c("ccc","ppp"))
+
+# Exactly what was removed (and why)
+removed_series <- fao_norm %>%
+  semi_join(to_drop, by = c("ccc","ppp")) %>%
+  distinct(ccc, ppp) %>%
+  left_join(to_drop, by = c("ccc","ppp")) %>%
+  arrange(reason, ppp, ccc)
+
+cat("Dropped series:", nrow(removed_series), "\n")
+cat("Remaining observations:", nrow(fao_yield_data_final_clean), "\n\n")
+
+# Breakdown by reason
+removed_series %>%
+  count(reason, name = "n_series") %>%
+  arrange(desc(n_series)) %>%
+  print()
+
+# Full list
+print(removed_series, n = Inf)
+
+#Winsorize under 0.1 ton of yields to 0.1
+fao_yield_data_final_clean <- fao_yield_data_final_clean %>%
+  mutate(YLD = ifelse(!is.na(YLD) & YLD < min_yld, min_yld, YLD))
+
+
+# (Optional) replace original object after audit:
+fao_yield_data_final <- fao_yield_data_final_clean
+
+
+```
+
+#2.Load and Reshape Climate Data
+
+```{r}
+# Get the list of countries from the FAO yield data (using original ISO codes)
+fao_countries <- unique(fao_data$ccc)
+
+# Define function to reshape climate data (assumes columns like "1950-01", "1950-02", …)
+reshape_climate_data <- function(df, val_name) {
+  df %>%
+    pivot_longer(
+      cols = matches("^[0-9]{4}-"),
+      names_to = "YearMonth",
+      values_to = val_name
+    ) %>%
+    mutate(
+      yyy = as.numeric(sub("-.*", "", YearMonth)),
+      Month = as.numeric(sub(".*-", "", YearMonth))
+    ) %>%
+    select(-YearMonth)
+}
+
+temp_mean <- read_excel(paste0(datpth, "era5-x0.25_timeseries_tas_timeseries_monthly_1950-2022_mean_historical_era5_x0.25_mean.xlsx")) %>%
+  filter(code %in% fao_countries) %>% rename(ccc = code)
+temp_min <- read_excel(paste0(datpth, "era5-x0.25_timeseries_tasmin_timeseries_monthly_1950-2022_mean_historical_era5_x0.25_mean.xlsx")) %>%
+  filter(code %in% fao_countries) %>% rename(ccc = code)
+temp_max <- read_excel(paste0(datpth, "era5-x0.25_timeseries_tasmax_timeseries_monthly_1950-2022_mean_historical_era5_x0.25_mean.xlsx")) %>%
+  filter(code %in% fao_countries) %>% rename(ccc = code)
+precip_data <- read_excel(paste0(datpth, "era5-x0.25_timeseries_pr_timeseries_monthly_1950-2022_mean_historical_era5_x0.25_mean.xlsx")) %>%
+  filter(code %in% fao_countries) %>% rename(ccc = code)
+
+
+temp_mean_long <- reshape_climate_data(temp_mean, "Temp_Mean")
+temp_min_long  <- reshape_climate_data(temp_min, "Temp_Min")
+temp_max_long  <- reshape_climate_data(temp_max, "Temp_Max")
+precip_data_long <- reshape_climate_data(precip_data, "Precipitation")
+
+temp_combined <- temp_mean_long %>%
+  inner_join(temp_min_long, by = c("ccc", "yyy", "Month")) %>%
+  inner_join(temp_max_long, by = c("ccc", "yyy", "Month"))
+
+
+
+```
+
+# 3. load and Fix ndvi data set
+
+```{r}
+# Step 1: Load FAOSTAT cropland file
+fao_area_raw <- read_csv(paste0(datpth, "FAOSTAT_cropland.csv"))
+
+# Build area weights from FAOSTAT cropland
+area_data <- fao_area_raw %>%
+  filter(
+    Element == "Area",
+    Item == "Cropland",
+    Year == 2020
+  ) %>%
+  transmute(
+    Area = Area,
+    AreaValue = as.numeric(Value)
+  ) %>%
+  left_join(
+    country_mapping %>%
+      transmute(
+        Area = `FAO.Country.Name`,
+        iso3c = ISO_Code
+      ),
+    by = "Area"
+  ) %>%
+  filter(!is.na(iso3c)) %>%
+  mutate(
+    iso3c = ifelse(iso3c == "SSD", "SSDN", iso3c)
+  ) %>%
+  group_by(iso3c) %>%
+  summarise(
+    Area = sum(AreaValue, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Step 2: Load NDVI dataset
+ndvi_peak_bottom <- read_rds(paste0(datpth, "peak_bottom_ndvi_month_country.RDS"))
+ndvi_season <- ndvi_peak_bottom %>% 
+  select(ISO3, peak.cropland)
+
+# Step 3: Aggregate for USSR & FSDN (BLX and ETF stay as-is in ndvi_season)
+synthetic_ndvi <- ndvi_season %>%
+  left_join(area_data, by = c("ISO3" = "iso3c")) %>%
+  mutate(Area = ifelse(is.na(Area), 0, Area)) %>%
+  filter(ISO3 %in% c(ex_ussr, former_sdn)) %>%
+  mutate(region = case_when(
+    ISO3 %in% ex_ussr ~ "USSR",
+    ISO3 %in% former_sdn ~ "FSDN"
+  )) %>%
+  group_by(region) %>%
+  summarize(
+    peak.cropland = floor(weighted.mean(peak.cropland, Area, na.rm = TRUE)),
+    .groups = "drop"
+  ) %>%
+  rename(ISO3 = region)
+
+# Step 4: Append USSR & FSDN to the original set
+ndvi_season <- bind_rows(ndvi_season, synthetic_ndvi)
+
+print(ndvi_season %>% filter(ISO3 %in% c("BLX", "ETF", "USSR", "FSDN")))
+summary(area_data)
+```
+
+###2.1. Compute Area-Weighted Climate Averages (Aggregated Regions)
+
+```{r}
+
+# Combine temperature and precipitation, and add area info
+climate_data <- temp_combined %>%
+  inner_join(precip_data_long, by = c("ccc", "yyy", "Month")) %>%
+  left_join(area_data, by = c("ccc" = "iso3c")) %>%
+  mutate(Area = ifelse(is.na(Area), 0, Area))  # <-- fill missing with 0 to avoid dropping rows
+
+# Region mapping for composites
+region_mapping <- data.frame(
+  ccc = c(ex_yug, ex_ussr, former_sdn, BLX, ETF),
+  region = c(rep("YSR", length(ex_yug)),
+             rep("USSR", length(ex_ussr)),
+             rep("FSDN", length(former_sdn)),
+             rep("BLX", length(BLX)),
+             rep("ETF", length(ETF))),
+  stringsAsFactors = FALSE
+)
+
+# Tag each country with its composite region
+climate_with_region <- climate_data %>%
+  left_join(region_mapping, by = "ccc") %>%
+  mutate(agg_ccc = if_else(is.na(region), ccc, region))
+
+# Create synthetic monthly regional aggregates for USSR, YSR, FSDN, BLX, ETF
+composite_climate <- climate_with_region %>%
+  filter(!is.na(region)) %>%
+  group_by(region, yyy, Month) %>%
+  summarize(
+    Temp_Mean = if (sum(Area, na.rm = TRUE) > 0) weighted.mean(Temp_Mean, Area, na.rm = TRUE) else mean(Temp_Mean, na.rm = TRUE),
+    Temp_Max  = if (sum(Area, na.rm = TRUE) > 0) weighted.mean(Temp_Max, Area, na.rm = TRUE) else mean(Temp_Max, na.rm = TRUE),
+    Temp_Min  = if (sum(Area, na.rm = TRUE) > 0) weighted.mean(Temp_Min, Area, na.rm = TRUE) else mean(Temp_Min, na.rm = TRUE),
+    Precipitation = if (sum(Area, na.rm = TRUE) > 0) weighted.mean(Precipitation, Area, na.rm = TRUE) else mean(Precipitation, na.rm = TRUE),
+    Area = sum(Area, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(ccc = region, agg_ccc = region)
+
+# Combine back into the main dataset
+climate_data_expanded <- bind_rows(climate_data, composite_climate)
+
+
+```
+
+### 2.2 Growing season based on ndvi
+
+```{r}
+# --- Merge NDVI into climate data
+climate_seasonal <- climate_data_expanded %>%
+  left_join(ndvi_season %>% select(ISO3, peak.cropland), by = c("ccc" = "ISO3"))
+
+# --- Drop missing peak.cropland (these are non-represented composites)
+climate_seasonal <- climate_seasonal %>%
+  filter(!is.na(peak.cropland))
+
+# --- Function for leap-year month lengths
+get_month_lengths <- function(year) {
+  is_leap <- (year %% 4 == 0 & (year %% 100 != 0 | year %% 400 == 0))
+  days <- c(31, ifelse(is_leap, 29, 28), 31, 30, 31, 30, 31, 31, 30, 31, 30, 31)
+  data.frame(Month = 1:12, Days = days)
+}
+
+l <- 5  # window length in months
+
+# --- Build seasonal window per country-year based on peak.cropland
+climate_seasonal <- climate_seasonal %>%
+  group_by(ccc, yyy) %>%
+  group_modify(~{
+    center <- unique(.x$peak.cropland)
+    if (is.na(center)) {
+      # Return empty tibble with correct columns
+      return(tibble(
+        ccc = character(),
+        yyy = numeric(),
+        Month = numeric(),
+        peak.cropland = numeric(),
+        Temp_Mean = numeric(),
+        Temp_Max = numeric(),
+        Temp_Min = numeric(),
+        Precipitation = numeric(),
+        Area = numeric(),
+        Days = numeric(),
+        adj_year = numeric()
+      ))
+    }
+
+    # Get leap-year-aware month lengths for this year
+    month_len <- get_month_lengths(.y$yyy)
+    .x <- .x %>% left_join(month_len, by = "Month")
+
+    # Build centered window (wrap across year edges)
+    season1 <- (center - (l - 1) / 2):(center + (l - 1) / 2)
+    season2 <- ifelse(season1 <= 0, season1 + 12, season1)
+    season2 <- ifelse(season2 > 12, season2 - 12, season2)
+
+    d <- .x %>% filter(Month %in% season2)
+
+    # Handle wrap-around (shift adj_year when season crosses Dec-Jan)
+    base_year <- .y$yyy[1]
+    if (length(unique(diff(season2))) != 1) {
+      select <- season2[1:which(diff(season2) < 0)]
+      d <- d %>% mutate(adj_year = if_else(Month %in% select, base_year + 1, base_year))
+    } else {
+      d <- d %>% mutate(adj_year = base_year)
+    }
+
+    d
+  }) %>%
+  ungroup()
+
+```
+
+###2.3 GDD Proxy using monthlies (Threshold of 5 C)
+
+```{r}
+
+threshold <- 5
+gdd_seasonal <- climate_seasonal %>%
+  group_by(ccc, season_year = adj_year) %>%   # use adj_year as the true "season year"
+  summarize(
+    Total_GDD = sum(pmax(((Temp_Max + Temp_Min) / 2) - threshold, 0) * Days, na.rm = TRUE),
+    Avg_Temp_Mean = mean(Temp_Mean, na.rm = TRUE),
+    Avg_Precip = mean(Precipitation, na.rm = TRUE),
+    Tot_Precip = sum(Precipitation,  na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(ccc, season_year) %>%
+  group_by(ccc) %>%
+  mutate(GDD_Trend = Total_GDD - dplyr::lag(Total_GDD)) %>%
+  ungroup() %>%
+  rename(yyy = season_year)   # rename back so it merges with FAO
+
+
+
+glimpse(gdd_seasonal)
+
+
+
+```
+
+###2.4. merge yield and clim Check for gaps
+
+```{r}
+# Merge the final yield dataset (fao_yield_data_final) with seasonal climate summary (gdd_seasonal)
+yield_climate_data <- fao_yield_data_final %>%
+  left_join(gdd_seasonal, by = c("ccc", "yyy")) %>%
+  arrange(ccc, ppp, yyy)
+
+glimpse(yield_climate_data)
+
+# Define your threshold (e.g., remove series with > 1/3 bad values)
+threshold <- 1/3
+
+# Identify and keep only clean series
+valid_series <- yield_climate_data %>%
+  group_by(ccc, ppp) %>%
+  summarize(
+    n_total = n(),
+    n_bad = sum(is.na(YLD) | YLD == 0),
+    bad_ratio = n_bad / n_total,
+    .groups = "drop"
+  ) %>%
+  filter(bad_ratio <= threshold)
+
+# Filter main dataset to include only the good series
+yield_climate_data_cleaned <- yield_climate_data %>%
+  semi_join(valid_series, by = c("ccc", "ppp"))
+
+# check how much is removed
+
+n_removed <- yield_climate_data %>%
+  anti_join(valid_series, by = c("ccc", "ppp")) %>%
+  distinct(ccc, ppp) %>%
+  nrow()
+
+cat("Removed", n_removed, "country-crop pairs due to > 1/3 missing or zero YLD values.\n")
+
+n_rows_removed <- yield_climate_data %>%
+  anti_join(valid_series, by = c("ccc", "ppp")) %>%
+  nrow()
+
+cat("Total rows removed:", n_rows_removed)
+
+#Total rows before
+n_before <- yield_climate_data %>%
+  distinct(ccc, ppp) %>%
+  nrow()
+print(n_before)
+
+#Total rows after cleaning
+n_after <- yield_climate_data_cleaned %>%
+  distinct(ccc, ppp) %>%
+  nrow()
+print(n_after)
+
+
+```
+
+##3. Additional preparation of data (log, delta, square etc.)
+
+###3.1 Prepare data for run (filter missing and so forth)
+
+```{r}
+## 1. Load Full FAO Data and Create a Wide Dataset
+## 1. Load and Merge Data
+selected_crops <- c("WT", "SF", "BA", "SB", "RP", "MA")
+selected_countries <- NULL  
+
+# Initial filtering
+yield_filtered <- fao_yield_data_final %>%
+  filter(ppp %in% selected_crops) %>%
+  { if (!is.null(selected_countries)) filter(., ccc %in% selected_countries) else . }
+
+climate_filtered <- gdd_seasonal %>%
+  { if (!is.null(selected_countries)) filter(., ccc %in% selected_countries) else . }
+
+# Merge and remove rows with missing core variables
+yield_climate_data_cleaned <- yield_filtered %>% 
+  left_join(climate_filtered, by = c("ccc", "yyy")) %>% 
+  filter(!is.na(YLD), !is.na(Total_GDD), !is.na(Tot_Precip)) %>% 
+  arrange(ccc, ppp, yyy)
+
+## 2. Process and Filter (No Logs)
+yield_climate_data_cleaned <- yield_climate_data_cleaned %>%
+  group_by(ccc, ppp) %>%
+  # Keep only series with 30+ years of data
+  filter(n() >= 30) %>%
+  mutate(
+    # First differences of raw levels
+    Delta_Yield  = YLD - dplyr::lag(YLD),
+    Delta_GDD    = Total_GDD - dplyr::lag(Total_GDD),
+    Delta_Precip = Tot_Precip - dplyr::lag(Tot_Precip)
+  ) %>% 
+  ungroup() %>%
+  # Drop the first year of each group (where Delta is NA)
+  filter(!is.na(Delta_Yield), !is.na(Delta_GDD), !is.na(Delta_Precip))
+
+## 3. Clean Regions
+# Ensure YSR and ex_ussr are defined as vectors before this
+to_drop <- c(YSR, ex_ussr)
+
+yield_climate_data_cleaned <- yield_climate_data_cleaned %>%
+  filter(!ccc %in% to_drop)
+
+# Final check
+glimpse(yield_climate_data_cleaned)
+
+```
+
+###DELETE: 3.2 fix up of geo map data, and lat zones (informative only)
+
+```{r}
+# Identify the component countries of the USSR
+ussr_countries <- c("RUS", "UKR", "BLR", "MDA", "GEO", "AZE", "ARM", "KAZ", "KGZ", "TJK", "TKM", "UZB")
+
+# Aggregate the attributes of the component countries
+ussr_data <- data.frame(
+  FIPS = "US",
+  ISO2 = "SU",
+  ISO3 = "USSR",
+  UN = mean(map_wld@data$UN[map_wld@data$ISO3 %in% ussr_countries], na.rm = TRUE),
+  NAME = "USSR",
+  AREA = sum(map_wld@data$AREA[map_wld@data$ISO3 %in% ussr_countries], na.rm = TRUE),
+  POP2005 = sum(as.numeric(map_wld@data$POP2005[map_wld@data$ISO3 %in% ussr_countries]), na.rm = TRUE),
+  REGION = mean(map_wld@data$REGION[map_wld@data$ISO3 %in% ussr_countries], na.rm = TRUE),
+  SUBREGION = mean(map_wld@data$SUBREGION[map_wld@data$ISO3 %in% ussr_countries], na.rm = TRUE),
+  LON = mean(map_wld@data$LON[map_wld@data$ISO3 %in% ussr_countries], na.rm = TRUE),
+  LAT = mean(map_wld@data$LAT[map_wld@data$ISO3 %in% ussr_countries], na.rm = TRUE),
+  REGION.NAME = "Asia",
+  region = "Asia",
+  FAO = "Rest of Europe and Central Asia"
+)
+
+# Create a new dataset that excludes the component countries of the USSR
+new_map_wld_data <- map_wld@data[!map_wld@data$ISO3 %in% ussr_countries, ]
+
+# Add the new row for the USSR to the new dataset
+new_map_wld_data <- rbind(new_map_wld_data, ussr_data)
+
+# Create a new SpatialPolygonsDataFrame with the merged USSR
+new_map_wld <- map_wld
+new_map_wld@data <- new_map_wld_data
+
+#fixup sudam name
+new_map_wld_data$ISO3[new_map_wld_data$ISO3 == "SDN"] <- "FSDN"
+# However, a simpler version with 5 labels would be
+# However, a simpler version with 5 labels would be
+lat_zones <- cut(
+  new_map_wld_data$LAT,
+  breaks = c(-90, -35, -23.27, 23.27, 35, 90),
+  labels = c("Temperate", "Sub‐tropical", "Tropical", "Sub‐tropical", "Temperate"),
+  include.lowest = TRUE
+)
+
+# Add the latitude zones to your dataframe
+new_map_wld_data$LAT_ZONE <- lat_zones
+# Convert LAT_ZONE to character to avoid invalid factor level error
+new_map_wld_data$LAT_ZONE <- as.character(new_map_wld_data$LAT_ZONE)
+
+# Manually assign LAT_ZONE values
+new_map_wld_data$LAT_ZONE[new_map_wld_data$ISO3 == "ETF"] <- "Tropical"
+new_map_wld_data$LAT_ZONE[new_map_wld_data$ISO3 == "CHN"] <- "Temperate"
+new_map_wld_data$LAT_ZONE[new_map_wld_data$ISO3 == "YSR"] <- "Temperate"
+new_map_wld_data$LAT_ZONE[new_map_wld_data$ISO3 == "LANT"] <- "Tropical"
+new_map_wld_data$LAT_ZONE[new_map_wld_data$ISO3 == "POLY"] <- "Tropical"
+new_map_wld_data$LAT_ZONE[new_map_wld_data$ISO3 == "MICRO"] <- "Temperate"
+new_map_wld_data$LAT_ZONE[new_map_wld_data$ISO3 == "BLX"] <- "Temperate"
+new_map_wld_data$LAT_ZONE[new_map_wld_data$ISO3 == "CSK"] <- "Temperate"
+new_map_wld_data$LAT_ZONE[new_map_wld_data$ISO3 == "FIN"] <- "Polar"
+
+# Convert LAT_ZONE back to factor if needed
+new_map_wld_data$LAT_ZONE <- as.factor(new_map_wld_data$LAT_ZONE)
+new_map_wld_data$LAT_ZONE <- as.character(new_map_wld_data$LAT_ZONE)
+# Map the LAT_ZONE values to yield_climate_data
+yield_climate_data_cleaned <- left_join(yield_climate_data_cleaned, new_map_wld_data[, c("ISO3", "LAT_ZONE")], by = c("ccc" = "ISO3"))
+
+```
+
+\*\*\*\*\*\*\*\*\*\*\*YIELD CLIMATE DATA CLEANED\*\*\*\*\*\*\*\*\*\* The data has beeen prepared up to this point and is located in
+
+#4. MAIN FUNCTION
+
+```{r}
+run_break_analysis <- function(data,
+                               selected_crops,
+                               selected_countries = NULL,
+                               model_formula,
+                               window_years = 15,
+                               global_test = FALSE) {
+
+  mod_formula <- stats::as.formula(model_formula)
+
+  # ---- templates (so bind_rows never breaks) ----
+  tmpl_breaks <- tibble::tibble(country=character(), crop=character(), break_year=numeric(),
+                                F_stat=numeric(), p_value=numeric(), significant=logical())
+  tmpl_global <- tibble::tibble(country=character(), crop=character(),
+                                global_p_value=numeric(), supF_stat=numeric(), supF_year=numeric(),
+                                global_significant=logical())
+  tmpl_mtn <- tibble::tibble(country=character(), crop=character(), yyy=numeric(), f_stat=numeric())
+  tmpl_bic <- tibble::tibble(country=character(), crop=character(), m_breaks=integer(),
+                             BIC_val=numeric(), is_chosen=logical())
+  tmpl_vars <- tibble::tibble(country=character(), crop=character(), break_year=numeric(),
+                              variable=character(), estimate_change=numeric(),
+                              p_value=numeric(), significant=logical())
+  tmpl_seg <- tibble::tibble(country=character(), crop=character(), segment=integer(),
+                             start=numeric(), end=numeric(), r_squared=numeric(), coefficients=list())
+
+  all_break_rows            <- list(tmpl_breaks)
+  all_global_test_rows      <- list(tmpl_global)
+  all_diagnostic_rows       <- list(tmpl_mtn)
+  all_model_fit_rows        <- list(tmpl_bic)
+  all_variable_details_rows <- list(tmpl_vars)
+  all_segment_rows          <- list(tmpl_seg)
+  results_list              <- list()
+
+  # ---- filter ----
+  filtered <- data %>%
+    dplyr::filter(ppp %in% selected_crops) %>%
+    { if (!is.null(selected_countries)) dplyr::filter(., ccc %in% selected_countries) else . } %>%
+    dplyr::arrange(ccc, ppp, yyy) %>%
+    tidyr::drop_na(dplyr::all_of(all.vars(mod_formula)))
+
+  group_keys <- filtered %>% dplyr::distinct(ccc, ppp)
+
+  for (i in seq_len(nrow(group_keys))) {
+
+    ccc_i <- as.character(group_keys$ccc[i])
+    ppp_i <- as.character(group_keys$ppp[i])
+
+    ts_df <- filtered %>%
+      dplyr::filter(ccc == ccc_i, ppp == ppp_i) %>%
+      dplyr::arrange(yyy)
+
+    n_obs <- nrow(ts_df)
+    if (n_obs < (2 * window_years + 1)) next
+
+    # ------------------------------------------------------------
+    # 0) F-stats mountain + global test (length-synced alignment)
+    # ------------------------------------------------------------
+    skip_pair <- FALSE
+    global_pval <- NA_real_
+    fs <- tryCatch(
+      strucchange::Fstats(mod_formula, data = ts_df,
+                          from = window_years / n_obs,
+                          to   = 1 - (window_years / n_obs)),
+      error = function(e) NULL
+    )
+
+    if (!is.null(fs)) {
+      f_vals <- as.numeric(fs$Fstats)
+      L <- length(f_vals)
+
+      if (L > 0) {
+        start_pt <- floor((n_obs - L) / 2) + 1
+        yrs <- ts_df$yyy[start_pt:(start_pt + L - 1)]
+
+        all_diagnostic_rows[[length(all_diagnostic_rows) + 1]] <- tibble::tibble(
+          country = ccc_i, crop = ppp_i, yyy = as.numeric(yrs), f_stat = as.numeric(f_vals)
+        )
+
+        global_pval <- tryCatch(strucchange::sctest(fs)$p.value, error = function(e) NA_real_)
+        peak_idx <- which.max(f_vals)
+
+        all_global_test_rows[[length(all_global_test_rows) + 1]] <- tibble::tibble(
+          country = ccc_i, crop = ppp_i,
+          global_p_value = as.numeric(global_pval),
+          supF_stat = as.numeric(f_vals[peak_idx]),
+          supF_year = as.numeric(yrs[peak_idx]),
+          global_significant = isTRUE(!is.na(global_pval) && global_pval <= 0.05)
+        )
+
+        if (isTRUE(global_test) && (is.na(global_pval) || global_pval > 0.05)) skip_pair <- TRUE
+      } else {
+        if (isTRUE(global_test)) skip_pair <- TRUE
+      }
+    } else {
+      if (isTRUE(global_test)) skip_pair <- TRUE
+    }
+
+    if (skip_pair) next
+
+    # ------------------------------------------------------------
+    # 1) Bai–Perron + full BIC path
+    # ------------------------------------------------------------
+    bp_full <- tryCatch(
+      strucchange::breakpoints(mod_formula, data = ts_df, h = window_years),
+      error = function(e) NULL
+    )
+    if (is.null(bp_full)) next
+
+    bic_path <- tryCatch(stats::AIC(bp_full, k = log(n_obs)), error = function(e) NULL)
+
+    bp_opt <- tryCatch(strucchange::breakpoints(bp_full), error = function(e) bp_full)
+    opt_bps <- bp_opt$breakpoints
+    n_breaks <- if (is.null(opt_bps) || all(is.na(opt_bps))) 0L else length(opt_bps)
+
+    if (!is.null(bic_path)) {
+      m_vec <- as.integer(seq_along(bic_path) - 1L)
+      all_model_fit_rows[[length(all_model_fit_rows) + 1]] <- tibble::tibble(
+        country = ccc_i, crop = ppp_i,
+        m_breaks = m_vec,
+        BIC_val = as.numeric(bic_path),
+        is_chosen = (m_vec == n_breaks)
+      )
+    }
+
+    bp_years <- if (n_breaks > 0) as.numeric(ts_df$yyy[opt_bps]) else numeric(0)
+
+    # ------------------------------------------------------------
+    # 2) Chow-style interaction test per breakpoint + shifts table
+    #    (proper joint test: restricted vs unrestricted)
+    # ------------------------------------------------------------
+    this_pair_breaks <- list()
+    this_pair_vars   <- list()
+
+    if (n_breaks > 0) {
+
+      # fit restricted once per pair
+      mod_restricted <- tryCatch(stats::lm(mod_formula, data = ts_df), error = function(e) NULL)
+      if (is.null(mod_restricted)) next
+
+      for (byear in bp_years) {
+
+        chow_df <- ts_df %>%
+          dplyr::mutate(post = dplyr::if_else(yyy > byear, 1L, 0L))
+
+        mod_unrestricted <- tryCatch(
+          stats::lm(stats::update(mod_formula, . ~ . * post), data = chow_df),
+          error = function(e) NULL
+        )
+        if (is.null(mod_unrestricted)) next
+
+        # Joint F-test: are all post-related terms jointly zero?
+        a12 <- tryCatch(stats::anova(mod_restricted, mod_unrestricted), error = function(e) NULL)
+        if (is.null(a12) || nrow(a12) < 2) next
+
+        fstat <- as.numeric(a12$F[2])
+        pval  <- as.numeric(a12$`Pr(>F)`[2])
+
+        row_b <- tibble::tibble(
+          country = ccc_i, crop = ppp_i, break_year = as.numeric(byear),
+          F_stat = fstat, p_value = pval,
+          significant = isTRUE(!is.na(pval) && pval <= 0.05)
+        )
+
+        all_break_rows[[length(all_break_rows) + 1]] <- row_b
+        this_pair_breaks[[length(this_pair_breaks) + 1]] <- row_b
+
+        # Variable-level shifts (interaction coefficients + intercept shift)
+        coef_out <- summary(mod_unrestricted)$coefficients
+        rn <- rownames(coef_out)
+
+        # "post" (intercept shift) and "something:post" (slope shifts)
+        post_terms <- rn[grepl("(^post$)|(:post$)|(^post:)", rn)]
+
+        for (term in post_terms) {
+          var_l <- dplyr::case_when(
+            term == "post" ~ "Intercept_Shift",
+            TRUE ~ gsub("^post:|:post$", "", term)
+          )
+
+          row_v <- tibble::tibble(
+            country = ccc_i, crop = ppp_i, break_year = as.numeric(byear),
+            variable = var_l,
+            estimate_change = as.numeric(coef_out[term, "Estimate"]),
+            p_value = as.numeric(coef_out[term, "Pr(>|t|)"]),
+            significant = isTRUE(as.numeric(coef_out[term, "Pr(>|t|)"]) <= 0.05)
+          )
+
+          all_variable_details_rows[[length(all_variable_details_rows) + 1]] <- row_v
+          this_pair_vars[[length(this_pair_vars) + 1]] <- row_v
+        }
+      }
+    }
+
+    # ------------------------------------------------------------
+    # 3) Segment models (non-overlapping, (lower, upper] intervals)
+    # ------------------------------------------------------------
+    this_pair_segments <- list()
+    seg_bounds <- c(min(ts_df$yyy) - 1, sort(bp_years), max(ts_df$yyy))
+
+    for (s in seq_len(length(seg_bounds) - 1)) {
+      seg_df <- ts_df %>% dplyr::filter(yyy > seg_bounds[s], yyy <= seg_bounds[s + 1])
+      if (nrow(seg_df) < window_years) next
+
+      seg_mod <- tryCatch(stats::lm(mod_formula, data = seg_df), error = function(e) NULL)
+      if (is.null(seg_mod)) next
+
+      row_s <- tibble::tibble(
+        country = ccc_i, crop = ppp_i, segment = as.integer(s),
+        start = seg_bounds[s] + 1,
+        end   = seg_bounds[s + 1],
+        r_squared = as.numeric(summary(seg_mod)$r.squared),
+        coefficients = list(stats::coef(seg_mod))
+      )
+
+      all_segment_rows[[length(all_segment_rows) + 1]] <- row_s
+      this_pair_segments[[length(this_pair_segments) + 1]] <- row_s
+    }
+
+    results_list[[paste(ccc_i, ppp_i, sep = "_")]] <- list(
+      break_years = bp_years,
+      chow_tests = dplyr::bind_rows(this_pair_breaks),
+      segments = dplyr::bind_rows(this_pair_segments),
+      variable_details = dplyr::bind_rows(this_pair_vars)
+    )
+  }
+
+  breaks_table           <- dplyr::bind_rows(all_break_rows)
+  global_test_table      <- dplyr::bind_rows(all_global_test_rows)
+  reviewer_evidence      <- dplyr::bind_rows(all_diagnostic_rows)
+  model_fit_table        <- dplyr::bind_rows(all_model_fit_rows)
+  variable_breaks_table  <- dplyr::bind_rows(all_variable_details_rows)
+  segment_table          <- dplyr::bind_rows(all_segment_rows)
+
+  # Summary table: dominant break = max F_stat (per pair), plus global test info
+  breaks_summary <- if (nrow(breaks_table) > 0) {
+    breaks_table %>%
+      dplyr::group_by(country, crop) %>%
+      dplyr::summarise(
+        break_years = paste(sort(unique(break_year)), collapse = ", "),
+        any_significant = any(significant, na.rm = TRUE),
+        max_F_stat = max(F_stat, na.rm = TRUE),
+        year_max_F = break_year[which.max(F_stat)],
+        chow_p_value = p_value[which.max(F_stat)],
+        .groups = "drop"
+      ) %>%
+      dplyr::left_join(global_test_table, by = c("country", "crop"))
+  } else {
+    global_test_table
+  }
+
+  list(
+    results = results_list,
+    breaks_summary = breaks_summary,
+    breaks_table = breaks_table,
+    variable_breaks_table = variable_breaks_table,
+    model_fit_table = model_fit_table,
+    reviewer_evidence = reviewer_evidence,
+    global_test_table = global_test_table,
+    segment_table = segment_table
+  )
+}
+
+```
+
+#5.Run MODELS
+
+```{r}
+# Run the function on a quadratic form
+break_output <- run_break_analysis(
+  data = yield_climate_data_cleaned,
+  selected_crops = c("WT", "BA", "MA", "SB", "RP","SF"),
+  selected_countries = NULL,
+  model_formula = "YLD ~ Total_GDD + I(Total_GDD^2) + Tot_Precip + I(Tot_Precip^2) + yyy",
+  window_years = 15,
+  global_test = FALSE
+)
+
+
+# Access your specific variable p-values
+var_stats <- break_output$variable_breaks_table
+```
+
+# II. Chapter 2 define breaks, review, and graph
+
+### 1. Select the break years and flag in main data set
+
+Filter to one final break per crop–country.Only significant breaks (p ≤ 0.05).Pick the highest F‑stat in that set.
+
+```{r}
+#flagging all the breaks
+final_breaks <- break_output$breaks_table %>%
+  filter(p_value <= 0.05) %>%
+  group_by(country, crop) %>%
+  slice_max(F_stat, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+dominant_breaks <- final_breaks %>%
+  transmute(country, crop, break_year)
+
+#Update the data set
+Dataset_wbreaks <- yield_climate_data_cleaned %>%
+  inner_join(final_breaks %>% select(country, crop, break_year),
+             by = c("ccc" = "country", "ppp" = "crop")) %>%
+  mutate(flag_before_after = if_else(yyy < break_year, 0, 1))
+
+Dataset_breaks <- yield_climate_data_cleaned %>%
+  left_join(final_breaks %>% select(country, crop, break_year),
+             by = c("ccc" = "country", "ppp" = "crop")) %>%
+  mutate(flag_before_after = if_else(yyy < break_year, 0, 1))
+#Flag goes to 0 if no break available
+Dataset_breaks[which(is.na(Dataset_breaks$break_year)), "flag_before_after" ]<-0
+Dataset_breaks[which(is.na(Dataset_breaks$break_year)), "break_year" ]<-2022
+```
+
+### 2. Fit lines on pre-after breaks
+
+We now re‑fit models separately for before/after break periods on the fulll dataset with breaks years selected.
+
+```{r}
+segment_models <-Dataset_breaks %>%
+  group_by(ccc, ppp, flag_before_after) %>%
+  group_modify(~ {
+    mod <- lm(YLD ~ Total_GDD + I(Total_GDD^2) + Tot_Precip + I(Tot_Precip^2) + yyy, data = .x)
+    tibble(
+      r_squared = summary(mod)$r.squared,
+      adj_r_squared = summary(mod)$adj.r.squared,
+      coefficients = list(coef(mod)),
+      marginal_effects = list(avg_slopes(mod))
+    )
+  }) %>%
+  ungroup()
+
+```
+
+### 3.Save the data
+
+```{r}
+#a) Full flagged dataset:
+Dataset_breaks[which((Dataset_breaks$break_year)=="2022"), "flag_before_after" ]<-1
+write.csv(Dataset_breaks,
+          file.path(datpthout, paste0("Processed_data_breaks_flagged_", format(Sys.Date(), "%Y%m%d"), ".csv")),
+          row.names = FALSE)
+
+# b) Segment models:
+
+segment_models_flat <- segment_models %>%
+  mutate(
+    coefficients = map_chr(coefficients, ~ paste(names(.x), round(.x, 3), collapse = "; ")),
+    marginal_effects = map_chr(marginal_effects, ~ paste0(.x$term, "=", round(.x$estimate, 4), collapse = "; "))
+  )
+
+write.csv(segment_models_flat,
+          file.path(datpthout, paste0("Fitted_lines_breaks", format(Sys.Date(), "%Y%m%d"), ".csv")),
+          row.names = FALSE)
+
+
+#a) Full flagged dataset:
+write.csv(Dataset_wbreaks,
+          file.path(datpthout, paste0("Processed_only_breaks_flagged_", format(Sys.Date(), "%Y%m%d"), ".csv")),
+          row.names = FALSE)
+
+```
+
+###4.1 Model diagnostics and model outputs
+
+```{r}
+# 1. Prepare the list with a safer selector
+list_of_datasets <- list(
+  "A_Model_Selection"   = break_output$breaks_summary,
+  "B_Break_Drivers"     = break_output$variable_breaks_table,
+  "C_Phase_Performance" = break_output$segment_table %>%
+                           dplyr::select(-dplyr::any_of(c("coefficients", "coefs"))),
+  "D_FStat_Mountains"   = break_output$reviewer_evidence,
+  "E_BIC_Elbow_Paths"   = break_output$model_fit_table
+)
+
+# 2. Export to Excel
+openxlsx::write.xlsx(list_of_datasets, 
+                     file = file.path(datpthout, "Structural_Change_Appendices_FINAL.xlsx"), 
+                     overwrite = TRUE)
+
+message("Success! All tabs (including the F-Stat Mountains) have been exported.")
+```
+
+###4.2 Select example to demonstrate
+
+```{r}
+# ==========================================================================
+# FRANCE CASE STUDY (PUBLICATION): DIAGNOSTIC FIGURE + SEPARATE AME TABLE
+# - (a) F-stat paths + chosen break year
+# - (b) BIC elbow + chosen m
+# - (c1/c2) Proper AMEs (quadratic-aware) Before vs After, with stars for SHIFT
+# - Separate publication table for crops with validated breaks
+# ==========================================================================
+
+# --- Packages ---
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(patchwork)
+library(purrr)
+library(broom)
+library(flextable)
+
+recode <- dplyr::recode
+
+stopifnot(exists("break_output"))
+stopifnot(exists("yield_climate_data_cleaned"))
+stopifnot(exists("datpthout"))
+
+# --- 1) Settings ---
+target_country <- "FRA"
+france_crops   <- c("BA", "MA", "RP", "WT", "SB")
+
+case_cols <- c(
+  "BA" = "#D55E00",
+  "MA" = "#0072B2",
+  "RP" = "#009E73",
+  "WT" = "#CC79A7",
+  "SB" = "#E69F00"
+)
+
+base_formula <- YLD ~ Total_GDD + I(Total_GDD^2) + Tot_Precip + I(Tot_Precip^2) + yyy
+
+pstars <- function(p) dplyr::case_when(
+  is.na(p) ~ "",
+  p < 0.01 ~ "***",
+  p < 0.05 ~ "**",
+  p < 0.10 ~ "*",
+  TRUE ~ ""
+)
+
+# number formatter: scientific notation for tiny values
+fmt_num <- function(x, digits = 3, tiny = 1e-3, sci_digits = 2) {
+  if (length(x) == 0 || is.na(x)) return("—")
+  if (abs(x) < .Machine$double.eps) return("0")
+  if (abs(x) < tiny) return(formatC(x, format = "e", digits = sci_digits))
+  sprintf(paste0("%.", digits, "f"), x)
+}
+
+coef_either <- function(model, terms) {
+  cf <- stats::coef(model)
+  terms <- as.character(terms)
+  hit <- intersect(terms, names(cf))
+  if (length(hit) == 0) return(0)
+  unname(cf[hit[1]])
+}
+
+fmt_coef_from_model <- function(model, term_name, digits = 3, tiny = 1e-3, sci_digits = 2) {
+  td <- broom::tidy(model)
+  row <- td %>% filter(term == term_name)
+  if (nrow(row) == 0) return("—")
+  paste0(fmt_num(row$estimate[1], digits = digits, tiny = tiny, sci_digits = sci_digits), pstars(row$p.value[1]))
+}
+
+ame_gdd_simple <- function(model, df) {
+  b1 <- coef_either(model, "Total_GDD")
+  b2 <- coef_either(model, "I(Total_GDD^2)")
+  mean(b1 + 2 * b2 * df$Total_GDD, na.rm = TRUE)
+}
+
+ame_prec_simple <- function(model, df) {
+  b1 <- coef_either(model, "Tot_Precip")
+  b2 <- coef_either(model, "I(Tot_Precip^2)")
+  mean(b1 + 2 * b2 * df$Tot_Precip, na.rm = TRUE)
+}
+
+# --- 2) Dominant break per crop (highest F among significant Chow tests) ---
+fr_breaks <- break_output$breaks_table %>%
+  filter(country == target_country, crop %in% france_crops, significant) %>%
+  group_by(crop) %>%
+  slice_max(F_stat, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  select(crop, break_year)
+
+fr_breaks <- tibble(crop = france_crops) %>%
+  left_join(fr_breaks, by = "crop") %>%
+  mutate(has_break = !is.na(break_year))
+
+# --- 3) Panel (a): F-stat mountains ---
+mountain_plot_data <- break_output$reviewer_evidence %>%
+  filter(country == target_country, crop %in% france_crops) %>%
+  left_join(fr_breaks, by = "crop") %>%
+  mutate(crop = factor(crop, levels = france_crops))
+
+mountain_labels <- mountain_plot_data %>%
+  filter(!is.na(break_year)) %>%
+  group_by(crop) %>%
+  summarise(
+    break_year = first(break_year),
+    xmin = min(yyy, na.rm = TRUE),
+    xmax = max(yyy, na.rm = TRUE),
+    ymax = max(f_stat, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    place_left = break_year > (xmin + 0.75 * (xmax - xmin)),
+    x_lab = if_else(place_left, break_year - 0.6, break_year + 0.6),
+    hjust_lab = if_else(place_left, 1, 0),
+    y_lab = ymax * 0.94
+  )
+
+p_mountain <- ggplot(mountain_plot_data, aes(x = yyy, y = f_stat, color = crop)) +
+  geom_line(linewidth = 0.8) +
+  geom_vline(
+    aes(xintercept = break_year),
+    linetype = "dashed",
+    linewidth = 0.6,
+    alpha = 0.85,
+    na.rm = TRUE
+  ) +
+  geom_text(
+    data = mountain_labels,
+    aes(x = x_lab, y = y_lab, label = as.integer(break_year), hjust = hjust_lab),
+    size = 3,
+    color = "black",
+    inherit.aes = FALSE
+  ) +
+  facet_wrap(~ crop, nrow = 1, scales = "free_y") +
+  scale_color_manual(values = case_cols) +
+  scale_x_continuous(expand = expansion(mult = c(0.03, 0.08))) +
+  labs(
+    title = "a) Structural break evidence (F-statistic paths)",
+    x = NULL,
+    y = "F-statistic"
+  ) +
+  theme_bw(base_size = 11) +
+  theme(
+    legend.position = "none",
+    strip.background = element_rect(fill = "grey95", color = NA),
+    panel.grid.minor = element_blank()
+  )
+
+# --- 4) Panel (b): BIC elbow ---
+bic_summary <- break_output$model_fit_table %>%
+  filter(country == target_country, crop %in% france_crops) %>%
+  mutate(crop = factor(crop, levels = france_crops))
+
+p_elbow <- ggplot(bic_summary, aes(x = m_breaks, y = BIC_val, group = crop, color = crop)) +
+  geom_line(linewidth = 0.7) +
+  geom_point(
+    aes(fill = is_chosen),
+    shape = 21,
+    size = 2.4,
+    stroke = 0.4,
+    color = "black"
+  ) +
+  scale_fill_manual(values = c("TRUE" = "black", "FALSE" = "white"), guide = "none") +
+  facet_wrap(~ crop, nrow = 1, scales = "free_y") +
+  scale_color_manual(values = case_cols) +
+  labs(
+    title = "b) Model selection (BIC over number of breaks)",
+    x = "Number of breaks (m)",
+    y = "BIC"
+  ) +
+  theme_bw(base_size = 11) +
+  theme(
+    legend.position = "none",
+    strip.background = element_rect(fill = "grey95", color = NA),
+    panel.grid.minor = element_blank()
+  )
+
+# --- 5) Proper AMEs (quadratic-aware) + shift tests ---
+fr_ts <- yield_climate_data_cleaned %>%
+  filter(ccc == target_country, ppp %in% france_crops) %>%
+  transmute(
+    ppp        = as.character(ppp),
+    yyy        = as.numeric(yyy),
+    YLD        = as.numeric(YLD),
+    Total_GDD  = as.numeric(Total_GDD),
+    Tot_Precip = as.numeric(Tot_Precip)
+  ) %>%
+  filter(complete.cases(.)) %>%
+  as.data.frame()
+
+compute_ame_and_shift <- function(crop_code, byear) {
+  df <- fr_ts %>%
+    filter(ppp == crop_code) %>%
+    arrange(yyy)
+
+  if (nrow(df) < 10) {
+    return(tibble(
+      Crop = crop_code,
+      Break = NA_integer_,
+      has_break = FALSE,
+      ame_gdd_before  = NA_real_,
+      ame_gdd_after   = NA_real_,
+      p_shift_gdd     = NA_real_,
+      ame_prec_before = NA_real_,
+      ame_prec_after  = NA_real_,
+      p_shift_prec    = NA_real_
+    ))
+  }
+
+  if (is.na(byear)) {
+    mod0 <- lm(base_formula, data = df)
+
+    return(tibble(
+      Crop = crop_code,
+      Break = NA_integer_,
+      has_break = FALSE,
+      ame_gdd_before  = ame_gdd_simple(mod0, df),
+      ame_gdd_after   = NA_real_,
+      p_shift_gdd     = NA_real_,
+      ame_prec_before = ame_prec_simple(mod0, df),
+      ame_prec_after  = NA_real_,
+      p_shift_prec    = NA_real_
+    ))
+  }
+
+  df <- df %>%
+    mutate(post = as.integer(yyy >= byear))
+
+  df_before <- df %>% filter(post == 0)
+  df_after  <- df %>% filter(post == 1)
+
+  if (nrow(df_before) < 5 || nrow(df_after) < 5) {
+    return(tibble(
+      Crop = crop_code,
+      Break = as.integer(byear),
+      has_break = FALSE,
+      ame_gdd_before  = NA_real_,
+      ame_gdd_after   = NA_real_,
+      p_shift_gdd     = NA_real_,
+      ame_prec_before = NA_real_,
+      ame_prec_after  = NA_real_,
+      p_shift_prec    = NA_real_
+    ))
+  }
+
+  mod_full <- lm(update(base_formula, . ~ . * post), data = df)
+
+  b_gdd_1 <- coef_either(mod_full, "Total_GDD")
+  b_gdd_2 <- coef_either(mod_full, "I(Total_GDD^2)")
+  d_gdd_1 <- coef_either(mod_full, c("Total_GDD:post", "post:Total_GDD"))
+  d_gdd_2 <- coef_either(mod_full, c("I(Total_GDD^2):post", "post:I(Total_GDD^2)"))
+
+  b_pr_1 <- coef_either(mod_full, "Tot_Precip")
+  b_pr_2 <- coef_either(mod_full, "I(Tot_Precip^2)")
+  d_pr_1 <- coef_either(mod_full, c("Tot_Precip:post", "post:Tot_Precip"))
+  d_pr_2 <- coef_either(mod_full, c("I(Tot_Precip^2):post", "post:I(Tot_Precip^2)"))
+
+  ame_gdd_before <- mean(b_gdd_1 + 2 * b_gdd_2 * df_before$Total_GDD, na.rm = TRUE)
+  ame_gdd_after  <- mean((b_gdd_1 + d_gdd_1) + 2 * (b_gdd_2 + d_gdd_2) * df_after$Total_GDD, na.rm = TRUE)
+
+  ame_prec_before <- mean(b_pr_1 + 2 * b_pr_2 * df_before$Tot_Precip, na.rm = TRUE)
+  ame_prec_after  <- mean((b_pr_1 + d_pr_1) + 2 * (b_pr_2 + d_pr_2) * df_after$Tot_Precip, na.rm = TRUE)
+
+  mod_nogddshift <- lm(
+    YLD ~ Total_GDD + I(Total_GDD^2) + Tot_Precip + I(Tot_Precip^2) + yyy +
+      post + post:Tot_Precip + post:I(Tot_Precip^2) + post:yyy,
+    data = df
+  )
+  p_shift_gdd <- tryCatch(
+    anova(mod_nogddshift, mod_full)$`Pr(>F)`[2],
+    error = function(e) NA_real_
+  )
+
+  mod_noprecshift <- lm(
+    YLD ~ Total_GDD + I(Total_GDD^2) + Tot_Precip + I(Tot_Precip^2) + yyy +
+      post + post:Total_GDD + post:I(Total_GDD^2) + post:yyy,
+    data = df
+  )
+  p_shift_prec <- tryCatch(
+    anova(mod_noprecshift, mod_full)$`Pr(>F)`[2],
+    error = function(e) NA_real_
+  )
+
+  tibble(
+    Crop = crop_code,
+    Break = as.integer(byear),
+    has_break = TRUE,
+    ame_gdd_before  = ame_gdd_before,
+    ame_gdd_after   = ame_gdd_after,
+    p_shift_gdd     = p_shift_gdd,
+    ame_prec_before = ame_prec_before,
+    ame_prec_after  = ame_prec_after,
+    p_shift_prec    = p_shift_prec
+  )
+}
+
+fr_ame <- fr_breaks %>%
+  mutate(out = map2(crop, break_year, compute_ame_and_shift)) %>%
+  select(out) %>%
+  unnest(out) %>%
+  mutate(
+    Crop = factor(Crop, levels = france_crops),
+    star_gdd  = pstars(p_shift_gdd),
+    star_prec = pstars(p_shift_prec)
+  )
+
+fr_ame_plot <- fr_ame %>% filter(has_break)
+
+to_long_for_panel <- function(df, var_before, var_after, star_col, label) {
+  df %>%
+    transmute(
+      Crop,
+      x_before = .data[[var_before]],
+      x_after  = .data[[var_after]],
+      stars    = .data[[star_col]]
+    ) %>%
+    mutate(variable = label) %>%
+    pivot_longer(cols = c(x_before, x_after), names_to = "period_raw", values_to = "x") %>%
+    mutate(Period = if_else(period_raw == "x_before", "Before", "After")) %>%
+    select(Crop, variable, Period, x, stars)
+}
+
+ame_long <- bind_rows(
+  to_long_for_panel(fr_ame_plot, "ame_gdd_before",  "ame_gdd_after",  "star_gdd",  "GDD"),
+  to_long_for_panel(fr_ame_plot, "ame_prec_before", "ame_prec_after", "star_prec", "Precip")
+) %>%
+  mutate(Period = factor(Period, levels = c("Before", "After")))
+
+ame_seg <- fr_ame_plot %>%
+  transmute(
+    Crop,
+    gdd_x0 = ame_gdd_before, gdd_x1 = ame_gdd_after, gdd_star = star_gdd,
+    prc_x0 = ame_prec_before, prc_x1 = ame_prec_after, prc_star = star_prec
+  )
+
+p_c1 <- ggplot() +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey35") +
+  geom_segment(
+    data = ame_seg,
+    aes(x = gdd_x0, xend = gdd_x1, y = Crop, yend = Crop),
+    linewidth = 0.7,
+    color = "grey60"
+  ) +
+  geom_point(
+    data = ame_long %>% filter(variable == "GDD"),
+    aes(x = x, y = Crop, color = Crop, fill = Period),
+    shape = 21,
+    size = 3.2,
+    stroke = 0.7
+  ) +
+  geom_text(
+    data = fr_ame_plot,
+    aes(x = ame_gdd_after, y = Crop, label = star_gdd),
+    nudge_y = 0.15,
+    size = 3.4,
+    color = "black"
+  ) +
+  scale_color_manual(values = case_cols) +
+  scale_fill_manual(values = c("Before" = "white", "After" = "grey20"), guide = "none") +
+  labs(
+    title = "c1) GDD sensitivity (Before vs After)",
+    x = "Average marginal effect of GDD",
+    y = NULL
+  ) +
+  theme_bw(base_size = 11) +
+  theme(
+    legend.position = "none",
+    panel.grid.minor = element_blank()
+  )
+
+p_c2 <- ggplot() +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey35") +
+  geom_segment(
+    data = ame_seg,
+    aes(x = prc_x0, xend = prc_x1, y = Crop, yend = Crop),
+    linewidth = 0.7,
+    color = "grey60"
+  ) +
+  geom_point(
+    data = ame_long %>% filter(variable == "Precip"),
+    aes(x = x, y = Crop, color = Crop, fill = Period),
+    shape = 21,
+    size = 3.2,
+    stroke = 0.7
+  ) +
+  geom_text(
+    data = fr_ame_plot,
+    aes(x = ame_prec_after, y = Crop, label = star_prec),
+    nudge_y = 0.15,
+    size = 3.4,
+    color = "black"
+  ) +
+  scale_color_manual(values = case_cols) +
+  scale_fill_manual(values = c("Before" = "white", "After" = "grey20"), guide = "none") +
+  labs(
+    title = "c2) Precip sensitivity (Before vs After)",
+    x = "Average marginal effect of precipitation",
+    y = NULL
+  ) +
+  theme_bw(base_size = 11) +
+  theme(
+    legend.position = "none",
+    panel.grid.minor = element_blank()
+  )
+
+p_c <- p_c1 + p_c2 + plot_layout(widths = c(1, 1))
+
+final_plot <- (p_mountain / p_elbow / p_c) +
+  plot_layout(heights = c(1.05, 1.0, 0.95)) +
+  plot_annotation(
+    title = "France: Structural break diagnostics (evidence, selection, and before/after effects)",
+    subtitle = "Stars indicate significance of the regime shift in sensitivity (nested F-test on interaction terms)."
+  )
+
+print(final_plot)
+
+ggsave(
+  filename = file.path(datpthout, "France_StructuralBreak_Diagnostics.png"),
+  plot = final_plot,
+  width = 190,
+  height = 120,
+  units = "mm",
+  dpi = 600,
+  bg = "white"
+)
+
+ggsave(
+  filename = file.path(datpthout, "France_StructuralBreak_Diagnostics.pdf"),
+  plot = final_plot,
+  width = 190,
+  height = 120,
+  units = "mm",
+  device = cairo_pdf
+)
+
+# ==========================================================================
+# PUBLICATION TABLE: crops with validated breaks
+# ==========================================================================
+
+fit_segment_table <- function(crop_code, byear) {
+  df <- fr_ts %>%
+    filter(ppp == crop_code) %>%
+    arrange(yyy)
+
+  if (is.na(byear)) return(NULL)
+
+  df_before <- df %>% filter(yyy < byear)
+  df_after  <- df %>% filter(yyy >= byear)
+
+  if (nrow(df_before) < 10 || nrow(df_after) < 10) return(NULL)
+
+  mod_before <- lm(base_formula, data = df_before)
+  mod_after  <- lm(base_formula, data = df_after)
+
+  tibble(
+    crop = crop_code,
+    term = c(
+      "R²",
+      "(Intercept)",
+      "Time (yyy)",
+      "Total GDD",
+      "Total GDD²",
+      "AME GDD",
+      "Tot Precip",
+      "Tot Precip²",
+      "AME Precip"
+    ),
+    Before = c(
+      fmt_num(summary(mod_before)$r.squared, digits = 3),
+      fmt_coef_from_model(mod_before, "(Intercept)", digits = 3),
+      fmt_coef_from_model(mod_before, "yyy", digits = 3),
+      fmt_coef_from_model(mod_before, "Total_GDD", digits = 3),
+      fmt_coef_from_model(mod_before, "I(Total_GDD^2)", digits = 3, tiny = 1e-3, sci_digits = 2),
+      fmt_num(ame_gdd_simple(mod_before, df_before), digits = 4, tiny = 1e-3, sci_digits = 2),
+      fmt_coef_from_model(mod_before, "Tot_Precip", digits = 3),
+      fmt_coef_from_model(mod_before, "I(Tot_Precip^2)", digits = 3, tiny = 1e-3, sci_digits = 2),
+      fmt_num(ame_prec_simple(mod_before, df_before), digits = 4, tiny = 1e-3, sci_digits = 2)
+    ),
+    After = c(
+      fmt_num(summary(mod_after)$r.squared, digits = 3),
+      fmt_coef_from_model(mod_after, "(Intercept)", digits = 3),
+      fmt_coef_from_model(mod_after, "yyy", digits = 3),
+      fmt_coef_from_model(mod_after, "Total_GDD", digits = 3),
+      fmt_coef_from_model(mod_after, "I(Total_GDD^2)", digits = 3, tiny = 1e-3, sci_digits = 2),
+      fmt_num(ame_gdd_simple(mod_after, df_after), digits = 4, tiny = 1e-3, sci_digits = 2),
+      fmt_coef_from_model(mod_after, "Tot_Precip", digits = 3),
+      fmt_coef_from_model(mod_after, "I(Tot_Precip^2)", digits = 3, tiny = 1e-3, sci_digits = 2),
+      fmt_num(ame_prec_simple(mod_after, df_after), digits = 4, tiny = 1e-3, sci_digits = 2)
+    )
+  ) %>%
+    pivot_longer(cols = c(Before, After), names_to = "Period", values_to = "value")
+}
+
+tab_long <- fr_breaks %>%
+  filter(has_break) %>%
+  mutate(out = map2(crop, break_year, fit_segment_table)) %>%
+  filter(!map_lgl(out, is.null)) %>%
+  select(out) %>%
+  unnest(out)
+
+pub_crops <- unique(tab_long$crop)
+
+tab_wide <- tab_long %>%
+  mutate(
+    Period = factor(Period, levels = c("Before", "After")),
+    col = paste0(crop, "_", Period)
+  ) %>%
+  select(term, col, value) %>%
+  pivot_wider(names_from = col, values_from = value) %>%
+  mutate(order = match(
+    term,
+    c("R²", "(Intercept)", "Time (yyy)", "Total GDD", "Total GDD²", "AME GDD",
+      "Tot Precip", "Tot Precip²", "AME Precip")
+  )) %>%
+  arrange(order) %>%
+  select(-order)
+
+hdr2_map <- c(term = "")
+for (cr in pub_crops) {
+  hdr2_map[paste0(cr, "_Before")] <- "Before"
+  hdr2_map[paste0(cr, "_After")]  <- "After"
+}
+
+group_titles <- c("", paste0("France ", pub_crops))
+group_widths <- c(1, rep(2, length(pub_crops)))
+
+ft_fr <- flextable(tab_wide) %>%
+  set_header_labels(values = hdr2_map) %>%
+  add_header_row(values = group_titles, colwidths = group_widths) %>%
+  theme_booktabs() %>%
+  align(align = "center", part = "all") %>%
+  align(j = 1, align = "left", part = "all") %>%
+  italic(i = ~ grepl("AME", term), j = 1) %>%
+  bold(part = "header") %>%
+  add_footer_lines(
+    "Note: * p<0.1; ** p<0.05; *** p<0.01. Small-magnitude coefficients are reported in scientific notation when rounding would display them as zero."
+  ) %>%
+  autofit()
+
+ft_fr
+
+save_as_docx(
+  ft_fr,
+  path = file.path(datpthout, "France_Break_Table.docx")
+)
+```
+
+#III. DESCRIPTIVE TABLES AND GRAPHS FOR
+
+##1. Input data summary
+
+```{r}
+# Calculate series length per crop-country pair
+series_lengths <- yield_climate_data_cleaned %>%
+  group_by(ppp, ccc) %>%
+  summarise(series_length = n_distinct(yyy), .groups = "drop")
+
+# Summary stats per crop
+series_summary <- series_lengths %>%
+  group_by(ppp) %>%
+  summarise(
+    avg_length = mean(series_length),
+    min_length = min(series_length),
+    max_length = max(series_length),
+    .groups = "drop"
+  )
+
+print(series_summary)
+
+# Histogram of series length per crop
+ggplot(series_lengths, aes(x = series_length)) +
+  geom_histogram(binwidth = 5, fill = "steelblue", color = "black") +
+  facet_wrap(~ppp, scales = "free_y") +
+  labs(
+    title = "Distribution of Data Series Lengths per Crop",
+    x = "Number of Years in Series",
+    y = "Count of Country-Series"
+  ) +
+  theme_minimal()
+```
+
+#2. climate and yield stats
+
+```{r}
+
+
+# Required libraries
+
+library(e1071)     # for skewness()
+
+# 1. Series‐length per crop–country and histogram
+panel_lengths <- yield_climate_data_cleaned %>%
+  count(ppp, ccc, name = "n_years")
+
+ggplot(panel_lengths, aes(n_years)) +
+  geom_histogram(binwidth = 5, fill = "steelblue", color = "black") +
+  facet_wrap(~ppp, scales = "free_y") +
+  labs(
+    title = "Distribution of Data Series Lengths per Crop",
+    x = "Number of Years in Series",
+    y = "Count of Country–Series"
+  ) +
+  theme_minimal()
+
+# 2. Panel‐length summary by crop
+crop_summary <- panel_lengths %>%
+  group_by(ppp) %>%
+  summarise(
+    n_panels   = n(),
+    avg_years  = round(mean(n_years), 2),
+    min_years  = min(n_years),
+    max_years  = max(n_years),
+    .groups = "drop"
+  ) %>%
+  rename(
+    Crop                   = ppp,
+    `Panels (n)`           = n_panels,
+    `Avg years`            = avg_years,
+    `Min years`            = min_years,
+    `Max years`            = max_years
+  )
+
+kable(crop_summary, caption = "Panel‐Length Summary by Crop") %>%
+  kable_styling(full_width = FALSE)
+
+# 3. Descriptive stats of yield by crop
+desc_yield <- yield_climate_data_cleaned %>%
+  group_by(ppp) %>%
+  summarise(
+    n        = n(),
+    Min      = round(min(YLD, na.rm = TRUE), 2),
+    Mean     = round(mean(YLD, na.rm = TRUE), 2),
+    `25th`   = round(quantile(YLD, 0.25, na.rm = TRUE), 2),
+    Median   = round(median(YLD, na.rm = TRUE), 2),
+    `75th`   = round(quantile(YLD, 0.75, na.rm = TRUE), 2),
+    Max      = round(max(YLD, na.rm = TRUE), 2),
+    SD       = round(sd(YLD, na.rm = TRUE), 2),
+    IQR      = round(IQR(YLD, na.rm = TRUE), 2),
+    CV       = round(SD / Mean, 2),
+    Skewness = round(skewness(YLD, na.rm = TRUE), 2),
+    .groups = "drop"
+  ) %>%
+  rename(Crop = ppp)
+
+kable(desc_yield, caption = "Descriptive Statistics of Yield by Crop") %>%
+  kable_styling(full_width = FALSE)
+
+# 4. Climate stats (across all panels)
+climate_stats <- yield_climate_data_cleaned %>%
+  summarise(
+    across(
+      .cols = c(Total_GDD, Tot_Precip),
+      .fns  = list(Min = min, Mean = mean, Max = max, SD = sd),
+      .names = "{col}_{fn}"
+    )
+  ) %>%
+  mutate(across(everything(), ~round(.x, 2)))
+
+kable(climate_stats, caption = "Aggregate Climate Statistics") %>%
+  kable_styling(full_width = FALSE)
+
+# 5. Country–Crop yield + outlier report
+country_crop_report <- yield_climate_data_cleaned %>%
+  group_by(ccc, ppp) %>%
+  summarise(
+    yld_min      = min(YLD, na.rm = TRUE),
+    yld_mean     = mean(YLD, na.rm = TRUE),
+    yld_max      = max(YLD, na.rm = TRUE),
+    yld_sd       = sd(YLD, na.rm = TRUE),
+    Q1           = quantile(YLD, 0.25, na.rm = TRUE),
+    Q3           = quantile(YLD, 0.75, na.rm = TRUE),
+    IQR          = IQR(YLD, na.rm = TRUE),
+    lower_bound  = Q1 - 1.5 * IQR,
+    upper_bound  = Q3 + 1.5 * IQR,
+    outlier_obs  = sum(YLD < lower_bound | YLD > upper_bound, na.rm = TRUE),
+    total_obs    = n(),
+    pct_outliers = round(100 * outlier_obs / total_obs, 2),
+    .groups      = "drop"
+  ) %>%
+  select(ccc, ppp, yld_min:pct_outliers)
+
+# Export
+write.csv(
+  country_crop_report,
+  file = file.path(datpthout, "country_crop_yield_report.csv"),
+  row.names = FALSE
+)
+
+
+
+```
+
+#3. Sptaial distribution of breaks (MAPS)
+
+```{r}
+library(sf)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(grid)        # for unit()
+# Optional but recommended for nice PNG/PDF outputs:
+# install.packages(c("ragg","systemfonts"))
+suppressWarnings({
+  have_ragg <- requireNamespace("ragg", quietly = TRUE)
+})
+
+# ---- 0) INPUT expected: `dominant_breaks` ----
+# Columns: country(ISO3), crop(BA/MA/RP/SB/SF/WT), break_year (numeric), ...
+stopifnot(all(c("country","crop","break_year") %in% names(dominant_breaks)))
+
+# ---- 1) Clean + label data ----
+dom_clean <- dominant_breaks %>%
+  filter(!is.na(crop), !is.na(break_year)) %>%
+  mutate(
+    crop_label = dplyr::recode(crop,
+      "BA"="Barley","MA"="Maize","RP"="Rapeseed",
+      "SB"="Soybean","SF"="Sunflower","WT"="Wheat",
+      .default = crop
+    ),
+    decade = floor(break_year/10)*10,
+    decade_lab = factor(paste0(decade,"s"))
+  )
+
+# Fix consistent decade order across facets/panels
+dec_levels <- sort(unique(dom_clean$decade))
+dom_clean <- dom_clean %>%
+  mutate(decade_lab = factor(decade_lab, levels = paste0(dec_levels,"s")))
+
+# ---- 2) World polygons + join ----
+world <- rnaturalearth::ne_countries(scale = "medium", returnclass = "sf") %>%
+  mutate(iso_fixed = dplyr::case_when(iso_a3 == "SDS" ~ "SSD", TRUE ~ iso_a3))
+
+map_df <- world %>%
+  left_join(dom_clean, by = c("iso_fixed" = "country"))
+
+# Keep only rows with real crops for faceting (but we’ll draw ALL borders from `world`)
+map_df_facets <- map_df %>% filter(!is.na(crop_label))
+
+# ---- 3) Robinson projection (journal-friendly equal-area look)
+world_robin <- st_transform(world, crs = "+proj=robin")
+map_robin   <- st_transform(map_df_facets, crs = "+proj=robin")
+
+# ---- 4) Helpers: consistent styling and two aesthetics (year vs decade) ----
+year_limits <- range(map_robin$break_year, na.rm = TRUE)  # same scale across panels
+
+base_map_bg <- function() {
+  geom_sf(data = world_robin, fill = "grey96", color = "grey65", linewidth = 0.25)
+}
+base_theme <- theme_minimal(base_size = 11) +
+  theme(
+    panel.grid = element_blank(),
+    axis.text = element_blank(),
+    axis.title = element_blank(),
+    strip.text = element_text(face = "bold", size = 11),
+    legend.position = "bottom",
+    legend.key.width = unit(18, "pt"),
+    legend.key.height = unit(6, "pt")
+  )
+
+# Continuous (year)
+map_layer_year <- function(data_sub) {
+  list(
+    geom_sf(data = data_sub, aes(fill = break_year), color = "grey35", linewidth = 0.25),
+    scale_fill_viridis_c(name = "Break year", limits = year_limits, na.value = "grey90")
+  )
+}
+# Binned (decade)
+map_layer_decade <- function(data_sub) {
+  list(
+    geom_sf(data = data_sub, aes(fill = decade_lab), color = "grey35", linewidth = 0.25),
+    scale_fill_viridis_d(name = "Break decade", na.value = "grey90", drop = FALSE)
+  )
+}
+
+# Split crops into two panels of three each
+crops1 <- c("Barley","Maize","Rapeseed")
+crops2 <- c("Soybean","Sunflower","Wheat")
+
+# ---- 5) Build FOUR plots: (P1 year, P2 year) + (P1 decade, P2 decade) ----
+p_year_1 <- ggplot() +
+  base_map_bg() +
+  map_layer_year(map_robin %>% filter(crop_label %in% crops1)) +
+  coord_sf(crs = "+proj=robin", datum = NA) +
+  facet_wrap(~ crop_label, ncol = 3) +
+  labs(title = "Dominant structural break in yield–climate sensitivity — Panel 1 (by years)",
+       subtitle = "Barley • Maize • Rapeseed") +
+  base_theme
+
+p_year_2 <- ggplot() +
+  base_map_bg() +
+  map_layer_year(map_robin %>% filter(crop_label %in% crops2)) +
+  coord_sf(crs = "+proj=robin", datum = NA) +
+  facet_wrap(~ crop_label, ncol = 3) +
+  labs(title = "Dominant structural break in yield–climate sensitivity — Panel 2 (by years)",
+       subtitle = "Soybean • Sunflower • Wheat") +
+  base_theme
+
+p_decade_1 <- ggplot() +
+  base_map_bg() +
+  map_layer_decade(map_robin %>% filter(crop_label %in% crops1)) +
+  coord_sf(crs = "+proj=robin", datum = NA) +
+  facet_wrap(~ crop_label, ncol = 3) +
+  labs(title = "Dominant structural breaks by decade — Panel 1",
+       subtitle = "Barley • Maize • Rapeseed") +
+  base_theme
+
+p_decade_2 <- ggplot() +
+  base_map_bg() +
+  map_layer_decade(map_robin %>% filter(crop_label %in% crops2)) +
+  coord_sf(crs = "+proj=robin", datum = NA) +
+  facet_wrap(~ crop_label, ncol = 3) +
+  labs(title = "Dominant structural breaks by decade — Panel 2",
+       subtitle = "Soybean • Sunflower • Wheat") +
+  base_theme
+
+# ---- 6) Show one (interactive dev) ----
+# p_year_1; p_year_2; p_decade_1; p_decade_2
+
+# ---- 7) Export (PDF vectors + high-res PNGs) ----
+# Sizes ~7x4 in per panel tend to look good in journals; bump base_size if smaller
+ggsave("dominant_breaks_year_panel1.pdf",   p_year_1,  width = 7, height = 4, device = cairo_pdf)
+ggsave("dominant_breaks_year_panel2.pdf",   p_year_2,  width = 7, height = 4, device = cairo_pdf)
+ggsave("dominant_breaks_decade_panel1.pdf", p_decade_1,width = 7, height = 4, device = cairo_pdf)
+ggsave("dominant_breaks_decade_panel2.pdf", p_decade_2,width = 7, height = 4, device = cairo_pdf)
+
+if (have_ragg) {
+  ggsave("dominant_breaks_year_panel1.png",   p_year_1,  width = 7, height = 4, dpi = 450, device = ragg::agg_png)
+  ggsave("dominant_breaks_year_panel2.png",   p_year_2,  width = 7, height = 4, dpi = 450, device = ragg::agg_png)
+  ggsave("dominant_breaks_decade_panel1.png", p_decade_1,width = 7, height = 4, dpi = 450, device = ragg::agg_png)
+  ggsave("dominant_breaks_decade_panel2.png", p_decade_2,width = 7, height = 4, dpi = 450, device = ragg::agg_png)
+}
+```
+
+#4. Generate a collection of Summary Breaks statistics (for analytical purposes)
+
+```{r}
+# --- Structural Break Summary from segment_models_flat ---
+
+# ----------------------------
+# 0) Helpers & settings
+# ----------------------------
+tol <- 1e-6
+sign_cat <- function(x, tol = 1e-6) {
+  ifelse(x >  tol, "positive",
+         ifelse(x < -tol, "negative", "no change"))
+}
+
+parse_me <- function(x) {
+  # robust parser for "Tot_Precip=...; Total_GDD=...; yyy=..."
+  if (is.na(x) || !nzchar(x))
+    return(c(Total_GDD = NA_real_, Tot_Precip = NA_real_, yyy = NA_real_))
+  parts <- str_split(x, ";")[[1]] %>% str_trim()
+  kv <- str_split(parts, "=", n = 2, simplify = TRUE)
+  if (ncol(kv) < 2)
+    return(c(Total_GDD = NA_real_, Tot_Precip = NA_real_, yyy = NA_real_))
+  vals <- suppressWarnings(as.numeric(kv[,2]))
+  nm   <- kv[,1]
+  out  <- setNames(rep(NA_real_, 3), c("Total_GDD","Tot_Precip","yyy"))
+  idx  <- match(nm, names(out))
+  out[idx[!is.na(idx)]] <- vals[!is.na(idx)]
+  out
+}
+
+# ----------------------------
+# 1) Parse marginal effects & normalize flag
+# ----------------------------
+coefs_long <- segment_models_flat %>%
+  mutate(flag_before_after = if_else(flag_before_after %in% c("1", 1), 1, 0),
+         me = map(marginal_effects, parse_me),
+         Total_GDD  = map_dbl(me, ~ .x[["Total_GDD"]]),
+         Tot_Precip = map_dbl(me, ~ .x[["Tot_Precip"]]),
+         yyy        = map_dbl(me, ~ .x[["yyy"]])) %>%
+  select(-me)
+
+# ----------------------------
+# 2) Coverage: detect complete vs. single-segment pairs
+# ----------------------------
+coverage_by_pair <- coefs_long %>%
+  count(ppp, ccc, flag_before_after, name = "n_obs") %>%
+  tidyr::pivot_wider(
+    names_from = flag_before_after,
+    values_from = n_obs,
+    names_glue = "flag_{flag_before_after}",
+    values_fill = 0
+  ) %>%
+  mutate(
+    has_before = flag_0 > 0,
+    has_after  = flag_1 > 0,
+    pair_type = dplyr::case_when(
+      has_before & has_after ~ "Complete (break detected)",
+      has_before & !has_after ~ "Only 'before' segment",
+      !has_before & has_after ~ "Only 'after' segment",
+      TRUE ~ "Unknown"
+    )
+  )
+
+# Per-crop coverage
+coverage_summary <- coverage_by_pair %>%
+  group_by(ppp, pair_type) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(ppp) %>%
+  mutate(share = round(100 * n / sum(n), 1)) %>%
+  ungroup() %>%
+  arrange(ppp, desc(n))
+
+# Overall totals
+coverage_total <- coverage_summary %>%
+  group_by(pair_type) %>%
+  summarise(
+    total_n = sum(n),
+    total_share = round(100 * total_n / sum(total_n), 1),
+    .groups = "drop"
+  )
+
+# Country lists for mapping/inspection (no-breaks)
+nobreak_countries <- coverage_by_pair %>%
+  filter(pair_type != "Complete (break detected)") %>%
+  mutate(which_segment = dplyr::case_when(
+    pair_type == "Only 'before' segment" ~ "before_only",
+    pair_type == "Only 'after' segment"  ~ "after_only",
+    TRUE ~ "unknown"
+  )) %>%
+  select(ppp, ccc, which_segment) %>%
+  arrange(ppp, ccc)
+
+# ----------------------------
+# 3) Direction & magnitudes on ALL pairs (includes "missing")
+#    -> for completeness, if you want to show that ~X% are missing deltas pre-flood
+# ----------------------------
+coefs_wide_all <- coefs_long %>%
+  tidyr::pivot_wider(
+    id_cols = c(ccc, ppp),
+    names_from = flag_before_after,
+    values_from = c(Total_GDD, Tot_Precip, yyy),
+    names_glue = "{.value}_{ifelse(flag_before_after==1,'after','before')}"
+  )
+
+deltas_all <- coefs_wide_all %>%
+  mutate(
+    d_GDD  = Total_GDD_after   - Total_GDD_before,
+    d_Prec = Tot_Precip_after  - Tot_Precip_before,
+    d_YYY  = yyy_after         - yyy_before
+  )
+
+dir_counts_all <- deltas_all %>%
+  transmute(ppp,
+            d_GDD_cat  = ifelse(is.finite(d_GDD),  sign_cat(d_GDD,  tol), "missing"),
+            d_Prec_cat = ifelse(is.finite(d_Prec), sign_cat(d_Prec, tol), "missing"),
+            d_YYY_cat  = ifelse(is.finite(d_YYY),  sign_cat(d_YYY,  tol), "missing")) %>%
+  tidyr::pivot_longer(cols = starts_with("d_"), names_to = "variable", values_to = "direction") %>%
+  mutate(variable = dplyr::recode(variable,
+                                  d_GDD_cat  = "ΔGDD",
+                                  d_Prec_cat = "ΔPrecip",
+                                  d_YYY_cat  = "ΔYYY")) %>%
+  group_by(ppp, variable, direction) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(ppp, variable) %>%
+  mutate(share = round(100 * n / sum(n), 1)) %>%
+  ungroup()
+
+# ----------------------------
+# 4) Direction & magnitudes on COMPLETE pairs only (main stats)
+# ----------------------------
+coefs_wide_complete <- coverage_by_pair %>%
+  filter(pair_type == "Complete (break detected)") %>%
+  select(ccc, ppp) %>%
+  inner_join(coefs_wide_all, by = c("ccc","ppp"))
+
+deltas <- coefs_wide_complete %>%
+  mutate(
+    d_GDD  = Total_GDD_after   - Total_GDD_before,
+    d_Prec = Tot_Precip_after  - Tot_Precip_before,
+    d_YYY  = yyy_after         - yyy_before
+  )
+
+# Direction counts (no "missing" now)
+dir_counts_complete <- deltas %>%
+  transmute(ppp,
+            d_GDD_cat  = sign_cat(d_GDD,  tol),
+            d_Prec_cat = sign_cat(d_Prec, tol),
+            d_YYY_cat  = sign_cat(d_YYY,  tol)) %>%
+  tidyr::pivot_longer(cols = starts_with("d_"), names_to = "variable", values_to = "direction") %>%
+  mutate(variable = dplyr::recode(variable,
+                                  d_GDD_cat  = "ΔGDD",
+                                  d_Prec_cat = "ΔPrecip",
+                                  d_YYY_cat  = "ΔYYY")) %>%
+  group_by(ppp, variable, direction) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(ppp, variable) %>%
+  mutate(share = round(100 * n / sum(n), 1)) %>%
+  ungroup()
+
+# Magnitudes & ratios
+mag_summary_complete <- deltas %>%
+  group_by(ppp) %>%
+  summarise(
+    mean_dGDD  = mean(d_GDD,  na.rm = TRUE),
+    mean_dP    = mean(d_Prec, na.rm = TRUE),
+    mean_dYYY  = mean(d_YYY,  na.rm = TRUE),
+    abs_dGDD   = mean(abs(d_GDD),  na.rm = TRUE),
+    abs_dP     = mean(abs(d_Prec), na.rm = TRUE),
+    abs_dYYY   = mean(abs(d_YYY),  na.rm = TRUE),
+    ratio_abs  = abs_dGDD / abs_dP,
+    .groups = "drop"
+  )
+
+# Direction symbols by crop (mean sign across complete pairs)
+dir_symbols_complete <- deltas %>%
+  group_by(ppp) %>%
+  summarise(
+    GDD_dir  = case_when(mean(d_GDD,  na.rm=TRUE) >  tol ~ "↑ increase",
+                         mean(d_GDD,  na.rm=TRUE) < -tol ~ "↓ decrease",
+                         TRUE ~ "→ no change"),
+    Prec_dir = case_when(mean(d_Prec, na.rm=TRUE) >  tol ~ "↑ increase",
+                         mean(d_Prec, na.rm=TRUE) < -tol ~ "↓ decrease",
+                         TRUE ~ "→ no change"),
+    YYY_dir  = case_when(mean(d_YYY,  na.rm=TRUE) >  tol ~ "↑ increase",
+                         mean(d_YYY,  na.rm=TRUE) < -tol ~ "↓ decrease",
+                         TRUE ~ "→ no change"),
+    .groups = "drop"
+  )
+
+# ----------------------------
+# 5) Inspect in console (optional)
+# ----------------------------
+coverage_summary
+coverage_total
+nobreak_countries
+dir_counts_all
+dir_counts_complete
+mag_summary_complete
+dir_symbols_complete
+
+# ----------------------------
+# 6) Export
+# ----------------------------
+write.csv(coverage_summary,
+          file.path(datpthout, paste0("BreakCoverage_ByCrop_", format(Sys.Date(), "%Y%m%d"), ".csv")),
+          row.names = FALSE)
+
+write.csv(coverage_total,
+          file.path(datpthout, paste0("BreakCoverage_Total_", format(Sys.Date(), "%Y%m%d"), ".csv")),
+          row.names = FALSE)
+
+write.csv(nobreak_countries,
+          file.path(datpthout, paste0("BreakCoverage_NoBreakCountries_", format(Sys.Date(), "%Y%m%d"), ".csv")),
+          row.names = FALSE)
+
+write.csv(dir_counts_all,
+          file.path(datpthout, paste0("BreakDirection_Counts_ALL_", format(Sys.Date(), "%Y%m%d"), ".csv")),
+          row.names = FALSE)
+
+write.csv(dir_counts_complete,
+          file.path(datpthout, paste0("BreakDirection_Counts_CompletePairs_", format(Sys.Date(), "%Y%m%d"), ".csv")),
+          row.names = FALSE)
+
+write.csv(mag_summary_complete,
+          file.path(datpthout, paste0("BreakMagnitude_Summary_CompletePairs_", format(Sys.Date(), "%Y%m%d"), ".csv")),
+          row.names = FALSE)
+
+write.csv(dir_symbols_complete,
+          file.path(datpthout, paste0("BreakDirection_Symbols_CompletePairs_", format(Sys.Date(), "%Y%m%d"), ".csv")),
+          row.names = FALSE)
+
+cat("✅ Exported coverage, country lists, and break statistics to:", datpthout, "\n")
+```
+
+#5. Graphics of the breaks (Violin plots)
+
+```{r}
+# 1. Standardized crop color scheme (Nature-style: high contrast, colorblind friendly)
+nice_cols <- c(
+  "BA" = "#E69F00", "MA" = "#56B4E9", "RP" = "#F0E442",
+  "SB" = "#009E73", "SF" = "#CC79A7", "WT" = "#0072B2"
+)
+
+
+# 1.a) Extract raw break years
+bai_breaks <- purrr::imap_dfr(break_output$results, ~{
+  parts <- strsplit(.y, "_")[[1]]
+  tibble(
+    country    = parts[1],
+    crop       = parts[2],
+    break_year = .x$break_years
+  )
+}) %>%
+  unnest_longer(break_year) %>%
+  filter(!is.na(break_year))   # drop NA rows here
+
+
+# 2. Panel A: All Detected Candidates
+p1 <- ggplot(bai_breaks, aes(x = crop, y = break_year, fill = crop)) +
+  geom_violin(width = 0.9, alpha = 0.2, color = NA) +
+  # Use quasirandom to avoid overplotting while showing every data point
+  geom_quasirandom(aes(color = crop), size = 1.0, alpha = 0.4, width = 0.25) +
+  # Black dots represent the median break year for that crop category
+  stat_summary(fun = median, geom = "point", size = 2, color = "black") +
+  scale_fill_manual(values = nice_cols) +
+  scale_color_manual(values = nice_cols) +
+  coord_flip() +
+  labs(title = "a)   ", x = NULL, y = "Year") +
+  theme_minimal(base_size = 11) + # Standard publication font size
+  theme(
+    legend.position = "none",
+    panel.grid.minor = element_blank(),
+    axis.title.x = element_text(face = "bold"),
+    plot.title = element_text(face = "bold", size = 12)
+  )
+
+# 3. Panel B: Dominant (Most Significant) Breaks
+p2 <- ggplot(dominant_breaks, aes(x = crop, y = break_year, fill = crop)) +
+  geom_violin(width = 0.9, alpha = 0.2, color = NA) +
+  geom_quasirandom(aes(color = crop), size = 1.2, alpha = 0.6, width = 0.25) +
+  # Black dots represent the median of the most significant break years
+  stat_summary(fun = median, geom = "point", size = 2, color = "black") +
+  scale_fill_manual(values = nice_cols) +
+  scale_color_manual(values = nice_cols) +
+  coord_flip() +
+  labs(title = "b)    ", x = NULL, y = "Year") +
+  theme_minimal(base_size = 11) +
+  theme(
+    legend.position = "none",
+    panel.grid.minor = element_blank(),
+    axis.title.x = element_text(face = "bold"),
+    plot.title = element_text(face = "bold", size = 12)
+  )
+
+# 4. Assemble with Patchwork
+# Note: Nature figures often use specific widths (89mm or 183mm). 
+# Adjust the width/height in ggsave accordingly.
+combined_plot <- p1 / p2 + 
+  plot_annotation(
+    caption = "Black points indicate median values. Violins show density distribution of detected structural breaks.",
+    theme = theme(plot.caption = element_text(size = 9, hjust = 0, italic = TRUE))
+  )
+
+print(combined_plot)
+
+# 5. Export for Publication
+ggsave("Figure_Breaks_Nature.pdf", combined_plot, width = 180, height = 220, units = "mm")
+
+combined_plot <- p1 / p2 + 
+  plot_annotation(
+    caption = "Black points indicate median values. Violins show density distribution of detected structural breaks.",
+    theme = theme(plot.caption = element_text(size = 9, hjust = 0, italic = TRUE))
+  )
+
+print(combined_plot)
+
+# Export for publication
+ggsave(
+  filename = file.path(datpthout, "Figure_Breaks_Nature.png"),
+  plot = combined_plot,
+  width = 180,
+  height = 220,
+  units = "mm",
+  dpi = 600,
+  bg = "white"
+)
+
+```
+
+## 6. Suplementary data output
+
+```{r}
+# =====================================================================
+# SUPPLEMENTARY / ANNEX DATA EXPORT FOR PUBLICATION
+# Generates:
+#   Table S1 – Break detection summary
+#   Table S2 – Regime comparison (levels, AMEs before/after)
+#   Table S3 – Crop-level summary statistics
+#   Table S4 – Heat-penalty direction counts
+#   Annex 1 (PDF) – S1–S4 rendered from MEMORY (no CSV read-back)
+# =====================================================================
+
+library(dplyr)
+library(readr)
+library(grid)
+library(gridExtra)
+
+# Your deltas object is the regime-wide AME comparison table
+test_df_3 <- deltas
+
+out_dir <- file.path(datpthout, "Supplementary")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+# ============================================================================
+# TABLE S1 — Break detection summary (from break test)
+# ============================================================================
+table_S1_break_summary <- break_output$breaks_table %>%
+  transmute(
+    country = country,
+    crop = crop,
+    break_year = break_year,
+    F_stat = F_stat,
+    p_value = p_value,
+    significant = significant
+  ) %>%
+  arrange(country, crop)
+
+write_csv(table_S1_break_summary,
+          file.path(out_dir, "Table_S1_Break_Summary.csv"))
+
+# ============================================================================
+# TABLE S2 — Regime comparison (LEVELS AMEs before vs after break)
+# ============================================================================
+table_S2_regime_levels <- test_df_3 %>%
+  transmute(
+    country = ccc,
+    crop = ppp,
+    AME_GDD_before  = Total_GDD_before,
+    AME_GDD_after   = Total_GDD_after,
+    d_GDD           = d_GDD,
+    AME_Prec_before = Tot_Precip_before,
+    AME_Prec_after  = Tot_Precip_after,
+    d_Prec          = d_Prec,
+    Trend_before    = yyy_before,
+    Trend_after     = yyy_after,
+    d_Trend         = d_YYY
+  ) %>%
+  arrange(country, crop)
+
+write_csv(table_S2_regime_levels,
+          file.path(out_dir, "Table_S2_Regime_Levels_AMEs.csv"))
+
+# ============================================================================
+# TABLE S3 — Crop-level summary (share stronger heat penalty)
+# ============================================================================
+table_S3_crop_summary <- test_df_3 %>%
+  group_by(ppp) %>%
+  summarise(
+    n_pairs = sum(!is.na(d_GDD)),
+    share_stronger_heat_penalty = mean(d_GDD < 0, na.rm = TRUE),
+    share_weaker_heat_penalty   = mean(d_GDD > 0, na.rm = TRUE),
+    median_d_GDD  = median(d_GDD, na.rm = TRUE),
+    median_d_Prec = median(d_Prec, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  rename(crop = ppp) %>%
+  arrange(desc(share_stronger_heat_penalty))
+
+write_csv(table_S3_crop_summary,
+          file.path(out_dir, "Table_S3_Crop_Level_Summary.csv"))
+
+# ============================================================================
+# TABLE S4 — Direction counts (heat penalty classification)
+# ============================================================================
+table_S4_heat_direction <- test_df_3 %>%
+  mutate(heat_response = case_when(
+    is.na(d_GDD) ~ NA_character_,
+    d_GDD < 0 ~ "Stronger heat penalty",
+    d_GDD > 0 ~ "Weaker heat penalty",
+    TRUE ~ "No change"
+  )) %>%
+  count(ppp, heat_response, name = "n") %>%
+  rename(crop = ppp)
+
+write_csv(table_S4_heat_direction,
+          file.path(out_dir, "Table_S4_Heat_Penalty_Direction.csv"))
+
+# ============================================================================
+# ANNEX 1 (PDF): Supplementary break data tables — FROM MEMORY
+# ============================================================================
+
+stopifnot(
+  exists("table_S1_break_summary"),
+  exists("table_S2_regime_levels"),
+  exists("table_S3_crop_summary"),
+  exists("table_S4_heat_direction")
+)
+
+# ---- helper: render a (possibly long) df across multiple PDF pages ----
+df_to_pages <- function(df, title, note = NULL,
+                        max_rows = 40, digits = 4, font = 7) {
+
+  df_print <- df
+  num_cols <- vapply(df_print, is.numeric, logical(1))
+  df_print[num_cols] <- lapply(df_print[num_cols], function(x) round(x, digits))
+
+  n <- nrow(df_print)
+  if (n == 0) {
+    grid.newpage()
+    grid.text(title, x = 0.02, y = 0.98, just = c("left","top"),
+              gp = gpar(fontface = "bold", fontsize = 12))
+    grid.text("(No rows)", x = 0.02, y = 0.92, just = c("left","top"),
+              gp = gpar(fontsize = 10, col = "grey35"))
+    return(invisible(NULL))
+  }
+
+  starts <- seq(1, n, by = max_rows)
+
+  for (k in seq_along(starts)) {
+    i1 <- starts[k]
+    i2 <- min(i1 + max_rows - 1, n)
+    chunk <- df_print[i1:i2, , drop = FALSE]
+
+    tg <- tableGrob(
+      chunk, rows = NULL,
+      theme = ttheme_minimal(
+        core   = list(fg_params = list(cex = font/10)),
+        colhead= list(fg_params = list(cex = (font+1)/10, fontface = "bold"))
+      )
+    )
+
+    grid.newpage()
+    grid.text(
+      if (length(starts) > 1) paste0(title, " (rows ", i1, "–", i2, " of ", n, ")") else title,
+      x = 0.02, y = 0.98, just = c("left","top"),
+      gp = gpar(fontface = "bold", fontsize = 12)
+    )
+
+    if (!is.null(note)) {
+      grid.text(note, x = 0.02, y = 0.945, just = c("left","top"),
+                gp = gpar(fontsize = 9, col = "grey25"))
+    }
+
+    # generous viewport; table will paginate rather than clip horizontally
+    pushViewport(viewport(x = 0.5, y = 0.46, width = 0.98, height = 0.86))
+    grid.draw(tg)
+    popViewport()
+  }
+
+  invisible(NULL)
+}
+
+# ---- output file ----
+annex_file <- file.path(out_dir, "Annex_1_Supplementary_Break_Tables.pdf")
+pdf(annex_file, width = 11, height = 8.5)  # landscape
+
+# ---- cover page ----
+grid.newpage()
+grid.text("Annex 1 — Supplementary Break Data Tables",
+          x = 0.5, y = 0.62, gp = gpar(fontface = "bold", fontsize = 18))
+grid.text(paste("Generated:", Sys.Date()),
+          x = 0.5, y = 0.54, gp = gpar(fontsize = 11))
+grid.text("Tables S1–S4 generated directly from the replication pipeline.",
+          x = 0.5, y = 0.42, gp = gpar(fontsize = 10))
+
+# ---- S1 ----
+df_to_pages(
+  table_S1_break_summary,
+  "Table S1 — Break detection summary",
+  "Candidate breaks with F-statistic, p-value, and significance flag.",
+  max_rows = 45, font = 7
+)
+
+# ---- S2 (SPLIT WIDE TABLE INTO TWO PAGES BY COLUMNS) ----
+S2a <- table_S2_regime_levels %>%
+  dplyr::select(country, crop, AME_GDD_before, AME_GDD_after, d_GDD, Trend_before, Trend_after, d_Trend)
+
+S2b <- table_S2_regime_levels %>%
+  dplyr::select(country, crop, AME_Prec_before, AME_Prec_after, d_Prec, Trend_before, Trend_after, d_Trend)
+
+df_to_pages(
+  S2a,
+  "Table S2a — Regime comparison (levels): GDD",
+  "Average marginal effects before/after break; levels-based comparison.",
+  max_rows = 45, font = 7
+)
+
+df_to_pages(
+  S2b,
+  "Table S2b — Regime comparison (levels): Precipitation",
+  "Average marginal effects before/after break; levels-based comparison.",
+  max_rows = 45, font = 7
+)
+
+# ---- S3 ----
+df_to_pages(
+  table_S3_crop_summary,
+  "Table S3 — Crop-level heat penalty summary",
+  "Share of series with stronger post-break heat penalty; median ΔGDD and ΔPrecip.",
+  max_rows = 60, font = 7
+)
+
+# ---- S4 ----
+df_to_pages(
+  table_S4_heat_direction,
+  "Table S4 — Heat penalty direction counts",
+  "Counts of stronger / weaker / unchanged post-break heat penalty by crop.",
+  max_rows = 60, font = 7
+)
+
+dev.off()
+
+cat("✅ Supplementary tables exported to:", out_dir, "\n")
+cat("✅ Annex 1 PDF generated:", annex_file, "\n")
+```
+
+### --- EXTRA SANITY CHECKS ---
+
+```{r}
+library(dplyr)
+library(purrr)
+library(tidyr)
+library(ggplot2)
+library(broom)
+
+pstars <- function(p) dplyr::case_when(
+  is.na(p) ~ "",
+  p < 0.01 ~ "***",
+  p < 0.05 ~ "**",
+  p < 0.1  ~ "*",
+  TRUE ~ ""
+)
+
+get_term <- function(tidy_df, term_name) {
+  out <- tidy_df %>% filter(term == term_name)
+  if (nrow(out) == 0) return(tibble(estimate = NA_real_, std.error = NA_real_, p.value = NA_real_))
+  out %>% select(estimate, std.error, p.value)
+}
+
+
+target_country <- "FRA"
+france_crops   <- c("BA","MA","RP","WT","SB")
+
+# dominant break per crop (Chow-significant highest F)
+fr_breaks <- break_output$breaks_table %>%
+  filter(country == target_country, crop %in% france_crops, significant) %>%
+  group_by(crop) %>%
+  slice_max(F_stat, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  select(crop, break_year)
+
+# keep all crops; those w/o break will be NA
+fr_breaks <- tibble(crop = france_crops) %>%
+  left_join(fr_breaks, by = "crop")
+
+fr_ts <- yield_climate_data_cleaned %>%
+  filter(ccc == target_country, ppp %in% france_crops) %>%
+  mutate(ppp = as.character(ppp))
+
+fit_crop_interaction <- function(crop_code, byear) {
+  
+  df <- fr_ts %>% filter(ppp == crop_code) %>% arrange(yyy)
+  
+  if (is.na(byear)) {
+    # no break: fit baseline model only (no Δ)
+    mod <- lm(YLD ~ Total_GDD + I(Total_GDD^2) + Tot_Precip + I(Tot_Precip^2) + yyy, data = df)
+    td  <- broom::tidy(mod)
+    
+    gdd_b  <- get_term(td, "Total_GDD")
+    prc_b  <- get_term(td, "Tot_Precip")
+    
+    return(tibble(
+      Crop = crop_code, Break = NA_integer_,
+      me_gdd_before = gdd_b$estimate,
+      me_gdd_after  = NA_real_,
+      d_me_gdd      = NA_real_, p_d_me_gdd = NA_real_, lo_d_me_gdd = NA_real_, hi_d_me_gdd = NA_real_,
+      me_prec_before = prc_b$estimate,
+      me_prec_after  = NA_real_,
+      d_me_prec      = NA_real_, p_d_me_prec = NA_real_, lo_d_me_prec = NA_real_, hi_d_me_prec = NA_real_
+    ))
+  }
+  
+  df <- df %>% mutate(post = as.integer(yyy >= byear))
+  
+  mod <- lm(
+    YLD ~ (Total_GDD + I(Total_GDD^2) + Tot_Precip + I(Tot_Precip^2) + yyy) * post,
+    data = df
+  )
+  
+  td <- broom::tidy(mod)
+  
+  # BEFORE slopes
+  gdd_b <- get_term(td, "Total_GDD")
+  prc_b <- get_term(td, "Tot_Precip")
+  
+  # DELTAS are interaction slopes (After - Before)
+  gdd_d <- get_term(td, "Total_GDD:post")
+  prc_d <- get_term(td, "Tot_Precip:post")
+  
+  # 95% CI for deltas
+  gdd_lo <- gdd_d$estimate - 1.96 * gdd_d$std.error
+  gdd_hi <- gdd_d$estimate + 1.96 * gdd_d$std.error
+  
+  prc_lo <- prc_d$estimate - 1.96 * prc_d$std.error
+  prc_hi <- prc_d$estimate + 1.96 * prc_d$std.error
+  
+  tibble(
+    Crop = crop_code, Break = as.integer(byear),
+    
+    me_gdd_before = gdd_b$estimate,
+    me_gdd_after  = gdd_b$estimate + gdd_d$estimate,
+    d_me_gdd      = gdd_d$estimate,
+    p_d_me_gdd    = gdd_d$p.value,
+    lo_d_me_gdd   = gdd_lo,
+    hi_d_me_gdd   = gdd_hi,
+    
+    me_prec_before = prc_b$estimate,
+    me_prec_after  = prc_b$estimate + prc_d$estimate,
+    d_me_prec      = prc_d$estimate,
+    p_d_me_prec    = prc_d$p.value,
+    lo_d_me_prec   = prc_lo,
+    hi_d_me_prec   = prc_hi
+  )
+}
+
+fr_table_raw <- fr_breaks %>%
+  mutate(tab = map2(crop, break_year, fit_crop_interaction)) %>%
+  select(tab) %>%
+  unnest(tab)
+
+
+
+fr_table_show <- fr_table_raw %>%
+  transmute(
+    Crop,
+    Break = ifelse(is.na(Break), "—", as.character(Break)),
+    
+    `ME(GDD) Before`  = signif(me_gdd_before, 3),
+    `ME(GDD) After`   = signif(me_gdd_after, 3),
+    `ΔME(GDD)`        = ifelse(is.na(d_me_gdd), "NA",
+                               paste0(signif(d_me_gdd, 3), pstars(p_d_me_gdd))),
+    
+    `ME(Prec) Before` = signif(me_prec_before, 3),
+    `ME(Prec) After`  = signif(me_prec_after, 3),
+    `ΔME(Prec)`       = ifelse(is.na(d_me_prec), "NA",
+                               paste0(signif(d_me_prec, 3), pstars(p_d_me_prec)))
+  )
+
+fr_table_show
+
+
+library(flextable)
+
+ft <- flextable(fr_table_show) %>%
+  autofit() %>%
+  fontsize(size = 9, part = "all") %>%
+  bold(part = "header") %>%
+  align(align = "center", part = "all")
+
+ft
+
+
+
+delta_long <- fr_table_raw %>%
+  select(Crop, Break,
+         d_me_gdd, lo_d_me_gdd, hi_d_me_gdd, p_d_me_gdd,
+         d_me_prec, lo_d_me_prec, hi_d_me_prec, p_d_me_prec) %>%
+  pivot_longer(
+    cols = -c(Crop, Break),
+    names_to = c(".value","var"),
+    names_pattern = "(d_me|lo_d_me|hi_d_me|p_d_me)_(gdd|prec)"
+  ) %>%
+  mutate(
+    variable = recode(var, gdd = "ΔME(GDD)", prec = "ΔME(Precip)"),
+    sig_cat = case_when(
+      p_d_me < 0.05 ~ "p<0.05",
+      p_d_me < 0.1  ~ "p<0.10",
+      TRUE ~ "n.s."
+    ),
+    Crop = factor(Crop, levels = france_crops)
+  )
+
+p_delta <- ggplot(delta_long, aes(x = d_me, y = Crop)) +
+  geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.4) +
+  geom_pointrange(aes(xmin = lo_d_me, xmax = hi_d_me, shape = sig_cat),
+                  linewidth = 0.5) +
+  facet_wrap(~variable, scales = "free_x") +
+  labs(
+    title = "France: regime shift in climate sensitivity at dominant breakpoints",
+    subtitle = "Δ marginal effects (After − Before); 95% CI from interaction term",
+    x = "Δ marginal effect (After − Before)",
+    y = NULL
+  ) +
+  theme_bw(base_size = 11) +
+  theme(panel.grid.minor = element_blank(),
+        legend.position = "bottom")
+
+print(p_delta)
+
+ggsave(file.path(datpthout, "Fig_France_DeltaME_Dotplots.pdf"),
+       p_delta, width = 180, height = 95, units = "mm", device = cairo_pdf)
+ggsave(file.path(datpthout, "Fig_France_DeltaME_Dotplots.png"),
+       p_delta, width = 180, height = 95, units = "mm", dpi = 600)
+
+
+
+
+
+```
+
+#sanity With and without SUPf
+
+```{r}
+# ============================================================
+# SUPF vs NO-SUPF COMPARISON WORKFLOW (FULL DIAGNOSTIC BLOCK)
+# ============================================================
+
+library(dplyr)
+
+# -------------------------------
+# 1. Run both specifications
+# -------------------------------
+out_nosupf <- run_break_analysis(
+  data = yield_climate_data_cleaned,
+  selected_crops = selected_crops,
+  selected_countries = selected_countries,
+  model_formula = "YLD ~ Total_GDD + I(Total_GDD^2) + Tot_Precip + I(Tot_Precip^2) + yyy",
+  window_years = 15,
+  global_test = FALSE
+)
+
+out_supf <- run_break_analysis(
+  data = yield_climate_data_cleaned,
+  selected_crops = selected_crops,
+  selected_countries = selected_countries,
+  model_formula = "YLD ~ Total_GDD + I(Total_GDD^2) + Tot_Precip + I(Tot_Precip^2) + yyy",
+  window_years = 15,
+  global_test = TRUE
+)
+
+# -------------------------------
+# 2. Panel coverage comparison
+# -------------------------------
+nosupf_pairs <- out_nosupf$breaks_summary %>% select(country, crop)
+supf_pairs   <- out_supf$breaks_summary   %>% select(country, crop)
+
+filtered_out <- anti_join(nosupf_pairs, supf_pairs, by = c("country","crop"))
+common_pairs <- inner_join(nosupf_pairs, supf_pairs, by = c("country","crop"))
+
+coverage_summary <- tibble(
+  total_panels_nosupf = nrow(nosupf_pairs),
+  total_panels_supf   = nrow(supf_pairs),
+  panels_removed_by_supf = nrow(filtered_out),
+  share_removed_pct = round(100 * nrow(filtered_out) / nrow(nosupf_pairs), 1)
+)
+
+# -------------------------------
+# 3. Compare dominant break years
+# -------------------------------
+cmp <- inner_join(
+  out_nosupf$breaks_summary %>%
+    select(country, crop,
+           break_year_nosupf = year_max_F,
+           chow_p_nosupf = chow_p_value,
+           global_p_nosupf = global_p_value,
+           supF_year_nosupf = supF_year),
+  out_supf$breaks_summary %>%
+    select(country, crop,
+           break_year_supf = year_max_F,
+           chow_p_supf = chow_p_value,
+           global_p_supf = global_p_value,
+           supF_year_supf = supF_year),
+  by = c("country","crop")
+)
+
+break_year_change_summary <- tibble(
+  panels_compared = nrow(cmp),
+  break_year_changed = sum(cmp$break_year_nosupf != cmp$break_year_supf, na.rm = TRUE)
+)
+
+# -------------------------------
+# 4. Classify break strength (Chow)
+# -------------------------------
+classify_strength <- function(p) {
+  case_when(
+    is.na(p) ~ "NA",
+    p <= 0.01 ~ "Strong",
+    p <= 0.05 ~ "Moderate",
+    p <= 0.10 ~ "Weak",
+    TRUE ~ "Not significant"
+  )
+}
+
+break_strength_table <- out_nosupf$breaks_summary %>%
+  mutate(
+    chow_strength = classify_strength(chow_p_value),
+    chow_sig_05 = !is.na(chow_p_value) & chow_p_value <= 0.05
+  ) %>%
+  count(chow_strength, name = "n_panels")
+
+# -------------------------------
+# 5. Global vs Local support flags
+# -------------------------------
+support_flags_table <- out_nosupf$breaks_summary %>%
+  mutate(
+    global_supported = !is.na(global_p_value) & global_p_value <= 0.05,
+    local_supported  = !is.na(chow_p_value) & chow_p_value <= 0.05,
+    support_class = case_when(
+      global_supported & local_supported ~ "Global + Local",
+      global_supported & !local_supported ~ "Global only",
+      !global_supported & local_supported ~ "Local only",
+      TRUE ~ "Neither"
+    )
+  ) %>%
+  count(support_class, name = "n_panels")
+
+# -------------------------------
+# 6. Diagnostic disagreement table
+# -------------------------------
+diagnostic_table <- out_nosupf$breaks_summary %>%
+  mutate(
+    global_supported = !is.na(global_p_value) & global_p_value <= 0.05,
+    local_supported  = !is.na(chow_p_value) & chow_p_value <= 0.05,
+    support_class = case_when(
+      global_supported & local_supported ~ "Global + Local",
+      global_supported & !local_supported ~ "Global only",
+      !global_supported & local_supported ~ "Local only",
+      TRUE ~ "Neither"
+    )
+  ) %>%
+  select(
+    country, crop,
+    supF_year, supF_stat, global_p_value,
+    year_max_F, max_F_stat, chow_p_value,
+    support_class
+  ) %>%
+  arrange(desc(support_class), chow_p_value)
+
+disagreement_only <- diagnostic_table %>%
+  filter(support_class %in% c("Global only", "Local only"))
+
+# -------------------------------
+# 7. Print compact summary
+# -------------------------------
+cat("\n==============================\n")
+cat("SUPF vs NO-SUPF COMPARISON\n")
+cat("==============================\n")
+
+cat("\nPanel Coverage:\n")
+print(coverage_summary)
+
+cat("\nBreak-Year Differences:\n")
+print(break_year_change_summary)
+
+cat("\nBreak Strength Distribution (Chow):\n")
+print(break_strength_table)
+
+cat("\nGlobal vs Local Support:\n")
+print(support_flags_table)
+
+cat("\nPanels Removed by supF (first 20):\n")
+print(head(filtered_out, 20))
+
+cat("\nDisagreement Table (first 20 rows):\n")
+print(head(disagreement_only, 20))
+
+# Optional: return all objects for further use
+comparison_results <- list(
+  coverage_summary = coverage_summary,
+  break_year_change_summary = break_year_change_summary,
+  break_strength_table = break_strength_table,
+  support_flags_table = support_flags_table,
+  filtered_out_panels = filtered_out,
+  diagnostic_table = diagnostic_table,
+  disagreement_only = disagreement_only
+)
+
+```
+
+# Expanding on the sanity
+
+```{r}
+
+# ============================================================
+# BREAK QUALITY & ROBUSTNESS ANALYSIS
+# ============================================================
+
+library(dplyr)
+library(ggplot2)
+library(scales)
+
+df <- out_nosupf$breaks_summary
+
+# ------------------------------------------------------------
+# 1. Add strength + support classification
+# ------------------------------------------------------------
+df2 <- df %>%
+  mutate(
+    chow_strength = case_when(
+      is.na(chow_p_value) ~ "NA",
+      chow_p_value <= 0.01 ~ "Strong",
+      chow_p_value <= 0.05 ~ "Moderate",
+      chow_p_value <= 0.10 ~ "Weak",
+      TRUE ~ "Not significant"
+    ),
+    global_supported = !is.na(global_p_value) & global_p_value <= 0.05,
+    local_supported  = !is.na(chow_p_value) & chow_p_value <= 0.05,
+    support_class = case_when(
+      global_supported & local_supported ~ "Global + Local",
+      global_supported & !local_supported ~ "Global only",
+      !global_supported & local_supported ~ "Local only",
+      TRUE ~ "Neither"
+    )
+  )
+
+# ------------------------------------------------------------
+# 2. TABLE: Global+Local vs others by crop
+# ------------------------------------------------------------
+table_support_crop <- df2 %>%
+  mutate(class2 = if_else(support_class == "Global + Local", "Global+Local", "Other")) %>%
+  count(crop, class2) %>%
+  tidyr::pivot_wider(names_from = class2, values_from = n, values_fill = 0) %>%
+  mutate(
+    total = `Global+Local` + Other,
+    share_global_local = round(100 * `Global+Local` / total, 1)
+  ) %>%
+  arrange(desc(share_global_local))
+
+table_support_crop
+# ---- This is your paper-ready table ----
+
+# ------------------------------------------------------------
+# 3. FIGURE: Share of Strong vs Weak breaks by crop
+# ------------------------------------------------------------
+fig_strength <- df2 %>%
+  filter(chow_strength %in% c("Strong","Moderate","Weak")) %>%
+  mutate(group = if_else(chow_strength == "Strong", "Strong", "Weak/Moderate")) %>%
+  count(crop, group) %>%
+  group_by(crop) %>%
+  mutate(share = n / sum(n)) %>%
+  ungroup()
+
+p_strength <- ggplot(fig_strength, aes(x = crop, y = share, fill = group)) +
+  geom_col(position = "stack", width = 0.7) +
+  scale_y_continuous(labels = percent_format()) +
+  scale_fill_manual(values = c("Strong" = "#1b9e77", "Weak/Moderate" = "#d95f02")) +
+  labs(
+    title = "Strength of detected structural breaks by crop",
+    x = "Crop",
+    y = "Share of breaks",
+    fill = "Break strength"
+  ) +
+  theme_bw(base_size = 11)
+
+print(p_strength)
+
+# ------------------------------------------------------------
+# 4. BREAK CREDIBILITY INDEX
+# ------------------------------------------------------------
+# Combines:
+#   - Chow F-stat magnitude
+#   - Chow p-value
+#   - Global support
+#
+# Normalization makes index comparable across panels.
+
+df_index <- df2 %>%
+  mutate(
+    F_norm = max_F_stat / max(max_F_stat, na.rm = TRUE),
+    p_norm = 1 - pmin(chow_p_value, 0.10) / 0.10,
+    support_bonus = case_when(
+      support_class == "Global + Local" ~ 1,
+      support_class == "Local only" ~ 0.7,
+      support_class == "Global only" ~ 0.5,
+      TRUE ~ 0.2
+    ),
+    credibility_index = round(100 * (0.5 * F_norm + 0.3 * p_norm + 0.2 * support_bonus), 1)
+  )
+
+# Summary distribution
+credibility_summary <- df_index %>%
+  summarise(
+    mean_index = mean(credibility_index, na.rm = TRUE),
+    median_index = median(credibility_index, na.rm = TRUE),
+    min_index = min(credibility_index, na.rm = TRUE),
+    max_index = max(credibility_index, na.rm = TRUE)
+  )
+
+credibility_summary
+
+# Top and bottom examples
+top_breaks <- df_index %>%
+  arrange(desc(credibility_index)) %>%
+  select(country, crop, year_max_F, credibility_index) %>%
+  head(10)
+
+low_breaks <- df_index %>%
+  arrange(credibility_index) %>%
+  select(country, crop, year_max_F, credibility_index) %>%
+  head(10)
+
+top_breaks
+low_breaks
+
+# Optional: histogram
+ggplot(df_index, aes(x = credibility_index)) +
+  geom_histogram(bins = 25, fill = "#2c7fb8", color = "white") +
+  labs(
+    title = "Distribution of Break Credibility Index",
+    x = "Credibility index (0–100)",
+    y = "Number of panels"
+  ) +
+  theme_bw(base_size = 11)
+
+```
+
+
+```{r}
+# ============================================================
+# FRANCE MAIZE (MA) LEVELS DIAGNOSTIC PLOT
+# - observed yields
+# - fitted values before and after the dominant break
+# - break year and segment R² shown on the figure
+# ============================================================
+
+library(dplyr)
+library(ggplot2)
+
+# ----------------------------
+# 1. Settings
+# ----------------------------
+target_country <- "FRA"
+target_crop    <- "MA"
+
+base_formula <- YLD ~ Total_GDD + I(Total_GDD^2) + Tot_Precip + I(Tot_Precip^2) + yyy
+
+# ----------------------------
+# 2. Get dominant break year
+# ----------------------------
+fr_ma_break <- break_output$breaks_table %>%
+  filter(country == target_country, crop == target_crop, significant) %>%
+  slice_max(F_stat, n = 1, with_ties = FALSE)
+
+stopifnot(nrow(fr_ma_break) == 1)
+
+break_year <- fr_ma_break$break_year[[1]]
+
+# ----------------------------
+# 3. Prepare data
+# ----------------------------
+df_ma <- yield_climate_data_cleaned %>%
+  filter(ccc == target_country, ppp == target_crop) %>%
+  arrange(yyy) %>%
+  mutate(regime = if_else(yyy < break_year, "Before", "After"))
+
+stopifnot(nrow(df_ma) > 0)
+
+# ----------------------------
+# 4. Fit separate levels models
+# ----------------------------
+df_before <- df_ma %>% filter(yyy < break_year)
+df_after  <- df_ma %>% filter(yyy >= break_year)
+
+mod_before <- lm(base_formula, data = df_before)
+mod_after  <- lm(base_formula, data = df_after)
+
+df_before <- df_before %>%
+  mutate(fitted = predict(mod_before, newdata = df_before))
+
+df_after <- df_after %>%
+  mutate(fitted = predict(mod_after, newdata = df_after))
+
+plot_df <- bind_rows(df_before, df_after)
+
+r2_before <- summary(mod_before)$r.squared
+r2_after  <- summary(mod_after)$r.squared
+
+# ----------------------------
+# 5. Label positions
+# ----------------------------
+y_top <- max(plot_df$YLD, plot_df$fitted, na.rm = TRUE)
+y_bot <- min(plot_df$YLD, plot_df$fitted, na.rm = TRUE)
+y_rng <- y_top - y_bot
+
+ann_df <- tibble(
+  x = c(min(df_before$yyy, na.rm = TRUE) + 2,
+        max(df_after$yyy, na.rm = TRUE) - 2),
+  y = c(y_top - 0.08 * y_rng,
+        y_top - 0.50 * y_rng),
+  lab = c(
+    paste0("Before break\nR² = ", sprintf("%.3f", r2_before)),
+    paste0("After break\nR² = ", sprintf("%.3f", r2_after))
+  ),
+  hjust = c(0, 1)
+)
+
+# ----------------------------
+# 6. Plot
+# ----------------------------
+p_fr_ma <- ggplot(plot_df, aes(x = yyy)) +
+  # observed series
+  geom_line(aes(y = YLD), linewidth = 0.7, color = "grey35") +
+  geom_point(aes(y = YLD), size = 1.6, color = "grey20") +
+
+  # fitted values by regime
+  geom_line(
+    data = df_before,
+    aes(y = fitted),
+    linewidth = 1.2,
+    color = "#1f78b4"
+  ) +
+  geom_line(
+    data = df_after,
+    aes(y = fitted),
+    linewidth = 1.2,
+    color = "#d95f02"
+  ) +
+
+  # break line
+  geom_vline(
+    xintercept = break_year,
+    linetype = "dashed",
+    linewidth = 0.7,
+    color = "black"
+  ) +
+
+  # break year label
+  annotate(
+    "text",
+    x = break_year + 0.5,
+    y = y_top - 0.02 * y_rng,
+    label = as.character(break_year),
+    hjust = 0,
+    vjust = 1,
+    size = 4
+  ) +
+
+  # R2 annotations
+  geom_label(
+    data = ann_df,
+    aes(x = x, y = y, label = lab, hjust = hjust),
+    inherit.aes = FALSE,
+    size = 3.4,
+    label.size = 0.2,
+    fill = "white"
+  ) +
+
+  scale_x_continuous(
+    breaks = pretty(plot_df$yyy, n = 6),
+    expand = expansion(mult = c(0.02, 0.06))
+  ) +
+  labs(
+    title = "France maize: levels-based structural break diagnostic",
+    subtitle = paste0(
+      "Observed yields with regime-specific fitted values; dominant break year = ",
+      break_year
+    ),
+    x = "Year",
+    y = "Yield (t/ha)",
+    caption = "Grey = observed yields; blue = pre-break fitted values; orange = post-break fitted values."
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    plot.subtitle = element_text(size = 10),
+    panel.grid.minor = element_blank(),
+    plot.caption = element_text(size = 9, hjust = 0),
+    axis.title = element_text(face = "bold")
+  )
+
+print(p_fr_ma)
+
+# ----------------------------
+# 7. Save high-res PNG
+# ----------------------------
+ggsave(
+  filename = file.path(datpthout, "France_Maize_Levels_Break_Diagnostic.png"),
+  plot = p_fr_ma,
+  width = 180,
+  height = 110,
+  units = "mm",
+  dpi = 600,
+  bg = "white"
+)
+```
+
+```{r}
+plot_france_levels_break <- function(crop_code) {
+  br <- break_output$breaks_table %>%
+    filter(country == "FRA", crop == crop_code, significant) %>%
+    slice_max(F_stat, n = 1, with_ties = FALSE)
+
+  if (nrow(br) == 0) return(NULL)
+
+  break_year <- br$break_year[[1]]
+
+  df_crop <- yield_climate_data_cleaned %>%
+    filter(ccc == "FRA", ppp == crop_code) %>%
+    arrange(yyy)
+
+  df_before <- df_crop %>% filter(yyy < break_year)
+  df_after  <- df_crop %>% filter(yyy >= break_year)
+
+  if (nrow(df_before) < 10 || nrow(df_after) < 10) return(NULL)
+
+  mod_before <- lm(base_formula, data = df_before)
+  mod_after  <- lm(base_formula, data = df_after)
+
+  df_before <- df_before %>% mutate(fitted = predict(mod_before, newdata = df_before))
+  df_after  <- df_after  %>% mutate(fitted = predict(mod_after,  newdata = df_after))
+
+  plot_df <- bind_rows(df_before, df_after)
+
+  r2_before <- summary(mod_before)$r.squared
+  r2_after  <- summary(mod_after)$r.squared
+
+  y_top <- max(plot_df$YLD, plot_df$fitted, na.rm = TRUE)
+  y_bot <- min(plot_df$YLD, plot_df$fitted, na.rm = TRUE)
+  y_rng <- y_top - y_bot
+
+  ann_df <- tibble(
+    x = c(min(df_before$yyy, na.rm = TRUE) + 2,
+          max(df_after$yyy, na.rm = TRUE) - 2),
+    y = c(y_top - 0.08 * y_rng,
+          y_top - 0.50 * y_rng),
+    lab = c(
+      paste0("Before break\nR² = ", sprintf("%.3f", r2_before)),
+      paste0("After break\nR² = ", sprintf("%.3f", r2_after))
+    ),
+    hjust = c(0, 1)
+  )
+
+  ggplot(plot_df, aes(x = yyy)) +
+    geom_line(aes(y = YLD), linewidth = 0.7, color = "grey35") +
+    geom_point(aes(y = YLD), size = 1.6, color = "grey20") +
+    geom_line(data = df_before, aes(y = fitted), linewidth = 1.2, color = "#1f78b4") +
+    geom_line(data = df_after,  aes(y = fitted), linewidth = 1.2, color = "#d95f02") +
+    geom_vline(xintercept = break_year, linetype = "dashed", linewidth = 0.7, color = "black") +
+    annotate(
+      "text",
+      x = break_year + 0.5,
+      y = y_top - 0.02 * y_rng,
+      label = as.character(break_year),
+      hjust = 0, vjust = 1, size = 4
+    ) +
+    geom_label(
+      data = ann_df,
+      aes(x = x, y = y, label = lab, hjust = hjust),
+      inherit.aes = FALSE,
+      size = 3.4,
+      linewidth = 0.2,
+      fill = "white"
+    ) +
+    scale_x_continuous(
+      breaks = pretty(plot_df$yyy, n = 6),
+      expand = expansion(mult = c(0.02, 0.06))
+    ) +
+    labs(
+      title = paste0("France ", crop_code, ": levels-based structural break diagnostic"),
+      subtitle = paste0("Observed yields with regime-specific fitted values; dominant break year = ", break_year),
+      x = "Year",
+      y = "Yield (t/ha)"
+    ) +
+    theme_bw(base_size = 12) +
+    theme(
+      plot.title = element_text(face = "bold"),
+      panel.grid.minor = element_blank(),
+      axis.title = element_text(face = "bold")
+    )
+}
+france_break_plot_crops <- fr_breaks %>%
+  filter(has_break) %>%
+  pull(crop)
+
+france_break_plots <- purrr::set_names(
+  purrr::map(france_break_plot_crops, plot_france_levels_break),
+  france_break_plot_crops
+)
+
+purrr::iwalk(france_break_plots, ~ {
+  if (!is.null(.x)) {
+    ggsave(
+      filename = file.path(datpthout, paste0("France_", .y, "_Levels_Break_Diagnostic.png")),
+      plot = .x,
+      width = 180, height = 110, units = "mm", dpi = 600, bg = "white"
+    )
+  }
+})
+```
+

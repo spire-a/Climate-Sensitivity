@@ -1,0 +1,478 @@
+
+---
+title: "Climate sensitivity — FD panel & robustness (clean)"
+output: html_document
+date: "2026-03-03"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+
+```{r libraries}
+# Core analysis stack used in the paper:
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(purrr)
+library(readr)
+
+library(plm)
+library(broom)
+library(marginaleffects)
+
+library(ggplot2)
+
+# Only needed if you export Annex PDF
+# library(grid)
+# library(gridExtra)
+```
+
+```{r paths}
+datpthout <- "C:\\Users\\arsovsp\\Documents\\Climate Risk\\output\\"
+```
+
+## 1) Load the latest processed breaks dataset
+
+```{r load-data}
+files <- list.files(
+  path = datpthout,
+  pattern = "Processed_data_breaks_flagged",
+  full.names = TRUE
+)
+
+stopifnot(length(files) > 0)
+info <- file.info(files)
+latest_file <- files[which.max(info$mtime)]
+
+sensitivity_dataset <- readr::read_csv(latest_file, show_col_types = FALSE)
+
+# Paper convention: break_year == 2022 (or NA) treated as "NO_BREAK"
+sensitivity_tagged <- sensitivity_dataset %>%
+  mutate(
+    break_tag = if_else(break_year == 2022 | is.na(break_year), "NO_BREAK", "HAS_BREAK")
+  )
+
+# Baseline FD sample: drop synthetic/no-break panels
+panel_dataset_fd <- sensitivity_tagged %>%
+  filter(break_tag == "HAS_BREAK") %>%
+  mutate(
+    flag_before_after = factor(as.integer(flag_before_after), levels = c(0, 1)),
+    ccc = as.character(ccc),
+    ppp = as.character(ppp)
+  )
+
+# Stress tests: deliberately misclassify NO_BREAK panels into a regime
+panel_dataset_flood_after <- sensitivity_tagged %>%
+  mutate(
+    flag_before_after = if_else(break_tag == "NO_BREAK", 1L, as.integer(flag_before_after)),
+    flag_before_after = factor(flag_before_after, levels = c(0, 1)),
+    ccc = as.character(ccc),
+    ppp = as.character(ppp)
+  )
+
+panel_dataset_flood_before <- sensitivity_tagged %>%
+  mutate(
+    flag_before_after = if_else(break_tag == "NO_BREAK", 0L, as.integer(flag_before_after)),
+    flag_before_after = factor(flag_before_after, levels = c(0, 1)),
+    ccc = as.character(ccc),
+    ppp = as.character(ppp)
+  )
+
+# Placebo: remove regime split entirely (all "before")
+panel_dataset_placebo <- sensitivity_tagged %>%
+  mutate(
+    flag_before_after = factor(0L, levels = c(0, 1)),
+    ccc = as.character(ccc),
+    ppp = as.character(ppp)
+  )
+
+date_str <- format(Sys.Date(), "%Y%m%d")
+crops_fd <- sort(unique(panel_dataset_fd$ppp))
+```
+
+## 2) Estimation helpers (paper specification)
+
+```{r helpers}
+# Cluster-robust SEs by country (group) — as per Methods
+vcov_cluster_ccc <- function(model) {
+  plm::vcovHC(model, type = "HC1", cluster = "group")
+}
+
+# FD-Pool with regime interaction (baseline specification)
+fit_fd_pool <- function(df, crop_id) {
+  d <- df %>% filter(ppp == crop_id)
+  if (nrow(d) < 10) return(NULL)
+  if (all(d$flag_before_after == "0") || all(d$flag_before_after == "1")) return(NULL)
+
+  mod <- plm::plm(
+    Delta_Yield ~ (Delta_GDD + I(Delta_GDD^2) + Delta_Precip + I(Delta_Precip^2)) * flag_before_after,
+    data  = d,
+    index = c("ccc", "yyy"),
+    model = "within"
+  )
+
+  list(model = mod, data = d)
+}
+
+# AMEs by regime over the full crop sample (avg_slopes with by=)
+extract_ames_by_regime <- function(fit_obj, crop_id, model_label) {
+  if (is.null(fit_obj)) return(NULL)
+
+  am <- marginaleffects::avg_slopes(
+    fit_obj$model,
+    variables = c("Delta_GDD", "Delta_Precip"),
+    by        = "flag_before_after",
+    newdata   = fit_obj$data,
+    vcov      = vcov_cluster_ccc
+  ) %>%
+    as.data.frame() %>%
+    mutate(
+      crop = crop_id,
+      model_type = model_label,
+      period = if_else(as.character(flag_before_after) == "0", "Before Break", "Post Break")
+    ) %>%
+    select(model_type, crop, period, term, estimate, std.error, conf.low, conf.high, p.value)
+
+  am
+}
+
+# Coefficients + within R2 (for tables / annex)
+extract_coefs <- function(fit_obj, crop_id, model_label) {
+  if (is.null(fit_obj)) return(NULL)
+
+  sm <- summary(fit_obj$model)
+  r2_within <- unname(sm$r.squared["within"])
+
+  broom::tidy(fit_obj$model, vcov = vcov_cluster_ccc) %>%
+    mutate(
+      crop = crop_id,
+      model_type = model_label,
+      r2_within = r2_within
+    )
+}
+
+# Rescale AMEs to "per 100 ΔGDD / per 100 mm ΔPrecip" (Figure 4 convention)
+rescale_ames_100 <- function(df) {
+  df %>%
+    mutate(
+      scale = case_when(
+        term == "Delta_GDD"    ~ 100,
+        term == "Delta_Precip" ~ 100,
+        TRUE ~ 1
+      ),
+      estimate  = estimate  * scale,
+      std.error = std.error * scale,
+      conf.low  = conf.low  * scale,
+      conf.high = conf.high * scale
+    ) %>%
+    select(-scale)
+}
+```
+
+## 3) Baseline FD-Pool results (core paper figure)
+
+```{r baseline-fit}
+fits_base <- set_names(map(crops_fd, ~ fit_fd_pool(panel_dataset_fd, .x)), crops_fd)
+
+fd_pool_coefs <- map_df(names(fits_base), ~ extract_coefs(fits_base[[.x]], .x, "Baseline"))
+fd_pool_ames  <- map_df(names(fits_base), ~ extract_ames_by_regime(fits_base[[.x]], .x, "Baseline"))
+
+# Save paper outputs
+write_csv(fd_pool_coefs, file.path(datpthout, paste0("FD_Pool_coeffs_", date_str, ".csv")))
+write_csv(fd_pool_ames,  file.path(datpthout, paste0("FD_Pool_AMEs_",   date_str, ".csv")))
+```
+
+## 3a) Figure 4 — Pure warming sensitivity (pre vs post) + warming penalty band
+```{r baseline-plot}
+plot_df <- fd_pool_ames %>%
+  rescale_ames_100() %>%
+  dplyr::filter(term %in% c("Delta_GDD", "Delta_Precip")) %>%
+  dplyr::mutate(
+    term = dplyr::recode(term,
+      "Delta_GDD"    = "ΔGDD (per 100 units)",
+      "Delta_Precip" = "ΔPrecip (per 100 mm)"
+    ),
+    period = factor(period, levels = c("Before Break", "Post Break")),
+    crop   = factor(crop, levels = crops_fd)
+  )
+
+ggplot2::ggplot(plot_df, ggplot2::aes(x = crop, y = estimate, fill = period)) +
+  ggplot2::geom_bar(stat = "identity", position = ggplot2::position_dodge(width = 0.85), color = "black") +
+  ggplot2::geom_errorbar(
+    ggplot2::aes(ymin = conf.low, ymax = conf.high),
+    position = ggplot2::position_dodge(width = 0.85),
+    width = 0.25
+  ) +
+  ggplot2::facet_wrap(~ term, scales = "free_y") +
+  ggplot2::labs(
+    title = "FD panel: regime-specific marginal effects (standardized shocks)",
+    subtitle = "Effects on ΔYield per 100 ΔGDD / per 100 mm ΔPrecip (95% CI)",
+    x = "Crop",
+    y = "Marginal effect on ΔYield (t/ha)",
+    fill = "Regime"
+  ) +
+  ggplot2::theme_minimal(base_size = 13) +
+  ggplot2::theme(legend.position = "top")
+```
+
+
+
+## 3b) Figure 5 — Pure warming sensitivity (pre vs post) + warming penalty band
+```{r fig5-warming-curves}
+# Figure 5 — Pure warming sensitivity (pre vs post) + warming penalty band
+# Uses fd_pool_coefs (Baseline) produced above
+
+# ---- Helpers: robustly identify and strip interaction terms ----
+is_delta_term <- function(term) {
+  stringr::str_detect(term, "flag_before_after1")
+}
+
+strip_interaction <- function(term) {
+  term %>%
+    stringr::str_replace(":flag_before_after1", "") %>%
+    stringr::str_replace("flag_before_after1:", "")
+}
+
+pick1 <- function(x) if (length(x) == 0) 0 else x[1]
+
+climate_terms <- c("Delta_GDD", "I(Delta_GDD^2)")
+
+# ---- Build β (pre) and δ (shift) tables (warming-only terms) ----
+coef_warm <- fd_pool_coefs %>%
+  dplyr::filter(model_type == "Baseline") %>%
+  dplyr::mutate(
+    is_delta  = is_delta_term(term),
+    base_term = strip_interaction(term)
+  ) %>%
+  dplyr::filter(base_term %in% climate_terms) %>%
+  dplyr::select(crop, base_term, is_delta, estimate, std.error)
+
+beta_tbl <- coef_warm %>%
+  dplyr::filter(!is_delta) %>%
+  dplyr::transmute(crop, base_term, beta = estimate, beta_se = std.error)
+
+delta_tbl <- coef_warm %>%
+  dplyr::filter(is_delta) %>%
+  dplyr::transmute(crop, base_term, delta = estimate, delta_se = std.error)
+
+coef_all <- beta_tbl %>%
+  dplyr::full_join(delta_tbl, by = c("crop", "base_term")) %>%
+  dplyr::mutate(
+    beta     = tidyr::replace_na(beta, 0),
+    delta    = tidyr::replace_na(delta, 0),
+    beta_se  = tidyr::replace_na(beta_se, 0),
+    delta_se = tidyr::replace_na(delta_se, 0),
+    post     = beta + delta
+  )
+
+# ---- Build curves per crop ----
+make_warming_curve <- function(crop_id, max_gdd = 300, n = 301) {
+  cc <- coef_all %>% dplyr::filter(crop == crop_id)
+  if (nrow(cc) == 0) return(NULL)
+
+  b1 <- pick1(cc$beta[cc$base_term == "Delta_GDD"])
+  b2 <- pick1(cc$beta[cc$base_term == "I(Delta_GDD^2)"])
+  p1 <- pick1(cc$post[cc$base_term == "Delta_GDD"])
+  p2 <- pick1(cc$post[cc$base_term == "I(Delta_GDD^2)"])
+  d1 <- pick1(cc$delta[cc$base_term == "Delta_GDD"])
+  d2 <- pick1(cc$delta[cc$base_term == "I(Delta_GDD^2)"])
+
+  d1_se <- pick1(cc$delta_se[cc$base_term == "Delta_GDD"])
+  d2_se <- pick1(cc$delta_se[cc$base_term == "I(Delta_GDD^2)"])
+
+  x <- seq(0, max_gdd, length.out = n)
+
+  pre   <- b1 * x + b2 * x^2
+  post  <- p1 * x + p2 * x^2
+  added <- d1 * x + d2 * x^2
+
+  # Penalty CI (delta-only), ignoring cov(d1,d2)
+  se_added <- sqrt((x^2) * (d1_se^2) + (x^4) * (d2_se^2))
+  added_lo <- added - 1.96 * se_added
+  added_hi <- added + 1.96 * se_added
+
+  tibble::tibble(
+    crop = crop_id,
+    Delta_GDD = x,
+    pre = pre,
+    post = post,
+    added = added,
+    added_lo = added_lo,
+    added_hi = added_hi
+  ) %>%
+    tidyr::pivot_longer(cols = c(pre, post, added), names_to = "curve", values_to = "dY") %>%
+    dplyr::mutate(
+      dY_lo = if_else(curve == "added", added_lo, NA_real_),
+      dY_hi = if_else(curve == "added", added_hi, NA_real_)
+    )
+}
+
+warming_curves_all <- purrr::map_dfr(unique(coef_all$crop), make_warming_curve)
+
+# ---- Plot (CI band only for penalty) ----
+warming_curves_all <- warming_curves_all %>%
+  dplyr::mutate(
+    curve = factor(curve, levels = c("added", "post", "pre"),
+                   labels = c("Warming Penalty", "Post-break", "Pre-break"))
+  )
+
+ggplot2::ggplot(warming_curves_all, ggplot2::aes(x = Delta_GDD, y = dY, colour = curve)) +
+  ggplot2::geom_ribbon(
+    data = subset(warming_curves_all, curve == "Warming Penalty"),
+    ggplot2::aes(ymin = dY_lo, ymax = dY_hi, fill = curve, colour = NULL),
+    alpha = 0.20
+  ) +
+  ggplot2::geom_line(linewidth = 0.9) +
+  ggplot2::facet_wrap(~ crop, scales = "free_y") +
+  ggplot2::labs(
+    title = "Pure warming sensitivity: pre- vs post-break climate slopes",
+    x = "ΔGDD (warming shock)",
+    y = "Predicted ΔYield (t/ha)",
+    colour = NULL,
+    fill = NULL
+  ) +
+  ggplot2::theme_minimal(base_size = 12) +
+  ggplot2::theme(legend.position = "right")
+```
+
+
+
+
+## 4) Robustness: flooded-after, flooded-before, placebo (stress tests)
+
+```{r robustness-fit}
+rob_df <- dplyr::bind_rows(
+  fd_pool_ames  %>% dplyr::mutate(model_type = "Baseline"),
+  ames_fafter   %>% dplyr::mutate(model_type = "Flooded-After"),
+  ames_fbefore  %>% dplyr::mutate(model_type = "Flooded-Before"),
+  ames_placebo  %>% dplyr::mutate(model_type = "Placebo")
+) %>%
+  rescale_ames_100() %>%
+  dplyr::filter(term %in% c("Delta_GDD","Delta_Precip")) %>%
+  dplyr::mutate(
+    term = dplyr::recode(term,
+      "Delta_GDD"    = "ΔGDD (per 100 units)",
+      "Delta_Precip" = "ΔPrecip (per 100 mm)"
+    ),
+    crop = factor(crop, levels = crops_fd),
+    model_type = factor(model_type, levels = c("Baseline","Flooded-Before","Flooded-After","Placebo")),
+    period = factor(period, levels = c("Before Break","Post Break","Placebo (pooled)"))
+  )
+
+ggplot2::ggplot(rob_df, ggplot2::aes(x = crop, y = estimate, fill = period)) +
+  ggplot2::geom_bar(stat = "identity", position = ggplot2::position_dodge(width = 0.85), color = "black") +
+  ggplot2::geom_errorbar(
+    ggplot2::aes(ymin = conf.low, ymax = conf.high),
+    position = ggplot2::position_dodge(width = 0.85),
+    width = 0.25
+  ) +
+  ggplot2::facet_grid(term ~ model_type, scales = "free_y") +
+  ggplot2::labs(
+    title = "Robustness stress tests (deliberate regime misclassification + placebo)",
+    subtitle = "AMEs on ΔYield per 100 ΔGDD / per 100 mm ΔPrecip (95% CI)",
+    x = "Crop",
+    y = "Marginal effect on ΔYield (t/ha)",
+    fill = "Regime"
+  ) +
+  ggplot2::theme_minimal(base_size = 12) +
+  ggplot2::theme(legend.position = "top")
+```
+
+## 5) Optional: Annex PDF (tables + sample definition + robustness summary)
+
+```{r annex-pdf, eval=FALSE}
+library(grid)
+library(gridExtra)
+
+out_dir <- file.path(datpthout, "Supplementary")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+# Sample definition used in baseline FD (HAS_BREAK only)
+panel_key <- sensitivity_tagged %>%
+  distinct(ccc, ppp, break_year, break_tag) %>%
+  arrange(ppp, ccc)
+
+sample_counts <- panel_key %>%
+  count(ppp, break_tag, name = "n_panels") %>%
+  pivot_wider(names_from = break_tag, values_from = n_panels, values_fill = 0) %>%
+  transmute(
+    crop = ppp,
+    panels_included = HAS_BREAK,
+    panels_excluded = NO_BREAK,
+    total_panels = HAS_BREAK + NO_BREAK
+  ) %>%
+  arrange(desc(panels_included))
+
+included_panels <- panel_key %>%
+  filter(break_tag == "HAS_BREAK") %>%
+  transmute(crop = ppp, country = ccc, break_year) %>%
+  arrange(crop, country)
+
+excluded_panels <- panel_key %>%
+  filter(break_tag == "NO_BREAK") %>%
+  transmute(crop = ppp, country = ccc, reason = "No statistically validated break") %>%
+  arrange(crop, country)
+
+# Compact robustness table (ΔGDD & ΔPrecip only)
+robust_table <- rob_df %>%
+  mutate(
+    Term = term,
+    Model = as.character(model_type),
+    Regime = as.character(period)
+  ) %>%
+  select(Model, Crop = crop, Regime, Term, estimate, std.error, conf.low, conf.high, p.value) %>%
+  arrange(Term, Crop, Model, Regime)
+
+df_to_pages <- function(df, title, rows_per_page = 28, digits = 4, font = 8) {
+  df2 <- as.data.frame(df)
+  num_cols <- sapply(df2, is.numeric)
+  df2[num_cols] <- lapply(df2[num_cols], function(x) round(x, digits))
+
+  n <- nrow(df2)
+  idx <- seq(1, n, by = rows_per_page)
+  for (s in idx) {
+    e <- min(s + rows_per_page - 1, n)
+    chunk <- df2[s:e, , drop = FALSE]
+    tg <- tableGrob(
+      chunk, rows = NULL,
+      theme = ttheme_minimal(
+        core    = list(fg_params = list(cex = font/10)),
+        colhead = list(fg_params = list(cex = (font+1)/10, fontface = "bold"))
+      )
+    )
+    grid.newpage()
+    grid.text(title, x = 0.02, y = 0.98, just = c("left","top"),
+              gp = gpar(fontface = "bold", fontsize = 12))
+    grid.text(paste0("Rows ", s, "–", e, " of ", n),
+              x = 0.98, y = 0.98, just = c("right","top"),
+              gp = gpar(fontsize = 9, col = "grey35"))
+    pushViewport(viewport(x = 0.5, y = 0.46, width = 0.98, height = 0.86))
+    grid.draw(tg)
+    popViewport()
+  }
+}
+
+annex_file <- file.path(out_dir, paste0("Annex_1_Supplementary_FD_Panel_and_Robustness_", date_str, ".pdf"))
+pdf(annex_file, width = 11, height = 8.5)
+
+df_to_pages(fd_pool_coefs %>% arrange(crop, term),
+            "Annex — FD-Pool coefficients (Baseline)", rows_per_page = 22, digits = 5)
+
+df_to_pages(sample_counts,
+            "Annex — Sample definition (counts by crop)", rows_per_page = 35, digits = 0)
+
+df_to_pages(included_panels,
+            "Annex — Included panels (HAS_BREAK)", rows_per_page = 30, digits = 0)
+
+df_to_pages(excluded_panels,
+            "Annex — Excluded panels (NO_BREAK)", rows_per_page = 30, digits = 0)
+
+df_to_pages(robust_table,
+            "Annex — Robustness summary (AMEs, standardized shocks)", rows_per_page = 22, digits = 5)
+
+dev.off()
+cat("Wrote: ", annex_file, "\n")
+```
+
